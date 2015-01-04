@@ -1,0 +1,200 @@
+# Changelog
+
+All notable changes to TraceML are documented here. This file follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions here
+should match the tags on [GitHub Releases](https://github.com/traceopt-ai/traceml/releases),
+which carry the full historical notes for versions predating this file.
+
+## [Unreleased]
+
+- The browser dashboard is now installed with
+  `pip install "traceml-ai[dashboard]"`; the default install remains focused on
+  summary and terminal output.
+- `traceml run train.py` now attaches the existing Hugging Face Trainer
+  integration automatically for standard training. Compatible manual setup is
+  reused; `watch`, disabled launches, and unrelated scripts install no
+  Hugging Face hooks.
+- `traceml run train.py` now activates the existing RF-DETR adapter for standard
+  eager detection training. Compatible manual `rfdetr.init()` calls are reused;
+  `watch` and disabled launches install no RF-DETR hooks.
+- **Breaking:** The `traceml` Python import path is no longer supported and
+  raises `ImportError`. Use `import traceml_ai as traceml` instead.
+- `traceml run train.py` now attaches the existing Lightning callback
+  automatically when the standard training loop is used. Existing compatible
+  manual setup is reused, and disabled runs install no framework hooks.
+- Lightning automatic attachment supports common eager CPU/CUDA single-device
+  and ordinary DDP training. It keeps RF-DETR on its dedicated adapter and
+  skips DeepSpeed, compiled models, and unsupported launch strategies. Forward
+  timing observes the selected module and its direct children without placing
+  hooks on every layer.
+- `traceml watch` remains resource-only and does not install Lightning training
+  instrumentation.
+
+## [0.4.1] - 2026-09-24
+
+- Added `traceml_ai.integrations.monai` for MONAI's `SupervisedTrainer`
+  (`pip install 'traceml-ai[monai]'`). `TraceMLHandler` publishes one step
+  per optimizer update with step time, Input Wait from the engine's own fetch
+  events, step memory, and H2D on CUDA. Other engines warn and are not traced.
+  The guide, the support-matrix row and the example follow.
+- MONAI steps now carry forward, backward and optimizer time. Forward is the
+  model call MONAI makes, so `zero_grad` stays outside it, and the optimizer is
+  timed on the trainer's own optimizer, once per update group.
+- Documented the MONAI integration: a guide, a support-matrix row, an entry in
+  the public API reference, and `examples/integrations/monai_minimal.py`, which
+  trains a small UNet on synthetic volumes and downloads nothing. CI runs that
+  example under `traceml run`, with and without gradient accumulation, and
+  fails if the summary loses Input Wait, forward, backward or optimizer time,
+  or if its step count disagrees with the optimizer updates the trainer made.
+- Added a MONAI case study: `notebooks/monai_dataloading_bottleneck.ipynb` and
+  its script, `examples/integrations/monai_dataloading_bottleneck.py`. It
+  trains a 3D UNet on the Medical Segmentation Decathlon spleen task six times,
+  changing one data-loading or compute setting per run, and compares each
+  adjacent pair with `traceml compare`. A `--smoke` mode sends synthetic
+  volumes through the same transforms and patch sampler, and the notebook smoke
+  job runs it on CPU. The support matrix now lists MONAI on CUDA as a
+  documented recipe, citing the notebook's T4 results.
+- **Breaking:** Public manual wrappers now require `traceml.init(...)` first
+  and reject phases already owned by automatic instrumentation. Move `init()`
+  before wrapper creation; custom non-PyTorch input iterators remain wrappable
+  in auto mode because the PyTorch DataLoader patch cannot observe them. The
+  TraceML kill switch remains unconditional: disabled wrappers return their
+  inputs unchanged, including before initialization. When tracing is enabled,
+  invalid wrapper targets retain their documented `TypeError`.
+- Hugging Face checkpoint resume no longer attributes lazily skipped iterable
+  batches to the first resumed optimizer group. That entire group's step
+  timing and memory telemetry is omitted; training runs normally and recording
+  resumes with the next group. Fresh runs and sampler-level skips are unaffected.
+- Hugging Face Trainer now captures the host-to-device transfers performed
+  while collecting an optimizer group's training microbatches. The transfers
+  contribute to Traced Step Time alongside forward, backward and optimizer
+  work, while DataLoader waiting remains separate Input Wait. Evaluation and
+  prediction input work stays excluded, and one TraceML step still represents
+  one optimizer-update group.
+- Added opt-in RF-DETR instrumentation for eager detection. Unsupported
+  configurations or adapter failures warn and leave native training intact.
+  Skipped instrumentation no longer accumulates DataLoader timing records.
+- RF-DETR and Lightning diagnostics cannot interrupt training when stderr fails.
+- Lightning timing excludes pre-fit loader previews and out-of-batch forwards;
+  forward instrumentation attaches after EMA initialization.
+- Corrected Step Time and Step Memory `training_total_steps`: three completed
+  steps now report `3`, previously `4`. The count uses the completed-step
+  counter even when history is pruned. Existing summary files are unchanged;
+  regenerated summaries use the corrected count. JSON schema remains `1.8`.
+
+## [0.4.0] - 2026-09-16
+
+- With the lifecycle guard installed by Hugging Face `init()`, Trainer
+  discards unfinished step captures when training raises, including before
+  automatic batch-size retries, and selects one TraceML callback per run to
+  prevent duplicate step counting. Callback ownership is reset after each
+  attempt so instances remain reusable.
+- **Removed:** `traceml_ai.integrations.huggingface.TraceMLTrainer` and its
+  `traceml_enabled` argument. The wrapper only installed the callback. Call
+  `traceml_ai.integrations.huggingface.init()` and register
+  `TraceMLTrainerCallback()` with standard `transformers.Trainer` instead.
+  For optional tracing, register the callback conditionally. See the
+  [HF migration instructions](docs/user_guide/integrations/huggingface.md#advanced-manual-setup)
+  for the replacement setup.
+- PyTorch Lightning: tracing now starts before batch transfer, excludes
+  non-training loader fetches, and groups accumulated micro-batches into one
+  TraceML step per optimizer update. Timings are summed within the group, CUDA
+  memory reports its peak, and incomplete groups are discarded. Non-update
+  optimizer calls are omitted, missing fetch or H2D patches produce a warning,
+  and real `Trainer.fit()` tests cover both Lightning namespaces.
+- PyTorch Lightning: new example `examples/integrations/lightning_dataloading_bottleneck.py`
+  (ResNet-18 on 320px Imagenette, `--profile` changes only the DataLoader) and
+  Colab notebook `notebooks/lightning_dataloading_bottleneck.ipynb`, which
+  compares the two runs and reads the per-step fetch wait to show the cold
+  first batch of every epoch; the notebook runs in the CPU notebook smoke job.
+- Step timing and memory now share one pending `StepCapture`. Successful steps
+  publish once through the existing queues; exceptions propagated through
+  `trace_step` discard partial measurements without advancing or reusing the
+  previous step number. Framework-specific failure detection remains separate.
+- Memory events and wire records no longer include `model_id`. The previous
+  per-model pending keying is replaced by one process-local memory snapshot,
+  published through the shared step-event handoff. Device metadata,
+  peak-counter boundaries, timestamps, byte units, and the SQLite schema are
+  unchanged.
+- Timing event types and queue access now live in
+  `instrumentation/step_events.py`. Producers and the timing sampler share an
+  explicit handoff; measurement boundaries, CUDA FIFO processing, and stored
+  output are unchanged.
+- **Breaking:** TraceML implementation errors now have one structured owner:
+  `rank_<global_rank>/traceml_errors.log`,
+  `aggregator/traceml_errors.log`, or
+  `nodes/node_<node_rank>/launcher_errors.log`. New runs no longer create the
+  duplicate `torchrun_error.log`, `runtime_error.log`, or
+  `aggregator_error.log` files.
+- Launcher-owned aggregator stderr is now saved separately at
+  `logs/<run-name>/aggregator/process.stderr.log`. Summary and dashboard modes
+  mirror it live; CLI mode preserves the Rich display and reports the saved
+  path if telemetry fails.
+- Training stdout and stderr are now saved by default in separate node-scoped
+  files under `logs/<run-name>/nodes/node_<node-rank>/`. Summary and dashboard
+  modes mirror them live; CLI mode keeps the Rich display clean and prints a
+  bounded stderr excerpt when training fails. Use
+  `--no-save-training-output` to inherit terminal descriptors instead. Capture
+  preserves application buffering, so abrupt termination cannot recover
+  stdout bytes the application has not flushed.
+- **Breaking:** Removed `--capture-stderr` and
+  `TRACEML_CAPTURE_STDERR`. The default two-stream launcher capture supersedes
+  the optional bounded `crash_stderr.log` tail.
+- **Breaking:** New runs no longer replace Python stdout/stderr or produce
+  per-rank `stdout_stderr.log` telemetry. Existing artifacts remain readable.
+- Root `system_manifest.json` writes now come only from global rank 0, avoiding
+  nondeterministic node ownership on shared filesystems.
+- **Breaking:** `--summary-window-rows` and
+  `TRACEML_SUMMARY_WINDOW_ROWS` were removed. Use
+  `--history-retention`, `history_retention`, or
+  `TRACEML_HISTORY_RETENTION`; row counts are not converted to durations.
+- Step Time now has one typed `load -> analyze -> diagnose -> present`
+  pipeline. CLI and dashboard share the live profile, the dashboard fans one
+  analysis to both views, and final summary runs the summary profile once
+  before a pure JSON/text projection.
+- Step Time SQLite reads are set-based and rank-independent, and unchanged
+  live source cursors reuse the existing analysis instead of decoding and
+  diagnosing the same window again.
+- **Breaking:** `traceml_ai.utils.step_time_window` and
+  `traceml_ai.utils.step_time_sqlite` were removed. Use
+  `traceml_ai.step_time.model`, `traceml_ai.step_time.sqlite`,
+  `traceml_ai.step_time.analysis`, and `traceml_ai.step_time.pipeline`.
+- **Breaking:** internal mapping diagnosis builders and the reporting-only
+  `RankStepSummary` facade were removed with the displaced Step Time pipeline.
+  Internal integrations now pass a canonical `StepTimeWindow` to
+  `diagnose_step_time_window(window, policy=...)` and project
+  `StepTimeRankFacts` / `StepTimeValues` directly.
+- NumPy 2 is supported: the `numpy<2` cap is removed, so installing
+  TraceML no longer downgrades NumPy in a modern environment and
+  resolvers no longer fall back to old TraceML releases.
+- The aggregator starts on Windows: `SO_REUSEPORT` is applied only on
+  platforms that have it.
+- `plotly` is no longer a dependency; nothing imported it, and its
+  absence no longer blocks dashboard mode.
+- `nicegui` carries a version floor covering the dashboard's API use,
+  so resolvers can no longer select a version that breaks at runtime.
+- Runtime dependencies are guarded against undocumented upper bounds,
+  and a scheduled CI leg resolves the newest published dependencies.
+- CONTRIBUTING documents the dependency policy behind these changes.
+- Cutting a release now also creates the GitHub Release entry, so a
+  published version is never missing its release notes.
+- The release workflow accepts four-component patch versions
+  (for example 0.3.5.1).
+
+## [0.3.5] - 2026-07-26
+
+- DeepSpeed training is supported alongside DDP and FSDP.
+- Telemetry export moved to a dedicated exporter thread, keeping TCP
+  sends off the training thread's critical path.
+- Runtime metadata (training strategy, environment) is captured and
+  carried into the final summary.
+- Step Time diagnosis refinements across straggler, input-bound, and
+  H2D paths, including FSDP warm-step filtering.
+- Package version is now derived from the git tag (`setuptools-scm`)
+  instead of a hand-edited string in `pyproject.toml`.
+- Releases publish to PyPI automatically on a `v*` tag push, via PyPI
+  Trusted Publishing (OIDC, no stored token).
+- CI now smoke-tests a clean install of the built wheel against the
+  documented CLI surface.
+
+<!-- maintenance 2015 -->
