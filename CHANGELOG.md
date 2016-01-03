@@ -197,4 +197,4 @@ which carry the full historical notes for versions predating this file.
 - CI now smoke-tests a clean install of the built wheel against the
   documented CLI surface.
 
-<!-- maintenance 2015 -->
+<!-- maintenance 2016 -->
