@@ -1,0 +1,506 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'version_*']
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - '.gitignore'
+  pull_request:
+    branches: [main, 'version_*']
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - '.gitignore'
+  workflow_dispatch:
+  schedule:
+    # Weekly early warning that the newest published dependencies still work.
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: ci-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pre-commit
+      - name: Run pre-commit
+        env:
+          SKIP: no-commit-to-branch
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  test-core:
+    name: Core Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # PRs only run on 3.10. Main branch and manual dispatches run on all versions.
+        python-version: >-
+          ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') &&
+              fromJSON('["3.10", "3.11", "3.12", "3.13"]') ||
+              fromJSON('["3.10"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          # tomli backports tomllib to 3.10 for the packaging guard.
+          pip install pytest 'tomli; python_version < "3.11"'
+      - name: Torch-free watch (end to end, no torch installed)
+        run: |
+          # This job installs TraceML without the torch extra, so it is the
+          # only leg that proves the documented torch-free path really
+          # works. Importing is not enough: the failure this guards against
+          # was a module-scope torch import inside the launch chain, which
+          # only surfaces when the command actually runs.
+          set -euo pipefail
+          echo "print('training done')" > tiny_train.py
+          python -m traceml_ai.launcher.cli watch tiny_train.py \
+            --mode=summary --run-name torch_free_ci | tee watch_out.txt
+          grep -q "training done" watch_out.txt
+          grep -q "TraceML Watch Summary" watch_out.txt
+          test -f logs/torch_free_ci/final_summary.json
+      - name: Run core tests
+        run: |
+          # Keep this matrix torch-free; torch-dependent paths run in the
+          # integration job, which installs the torch extra explicitly.
+          pytest \
+            tests/arch \
+            tests/config \
+            tests/regression \
+            tests/samplers \
+            tests/core \
+            tests/step_time \
+            tests/diagnostics \
+            tests/reporting/test_view.py \
+            tests/telemetry \
+            -q
+
+  test-windows-teardown:
+    name: Windows Process Teardown
+    # The process-group teardown path is platform-specific and cannot be
+    # exercised on Linux, where the POSIX branch always wins. This is the
+    # only leg that proves a grandchild is actually reaped on Windows.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+      - name: Run process teardown tests
+        run: pytest tests/runtime/test_process_group_teardown.py -q
+
+  test-integration:
+    name: Integration Smoke Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # hf pulls transformers+accelerate so tests/integrations
+          # actually RUNS the HuggingFace suite (incl. the #276 H2D
+          # coverage-window regression tests) instead of skipping it.
+          # lightning does the same for the real Trainer.fit() tests and
+          # the Lightning conformance harness.
+          pip install -e ".[torch,dashboard,hf,lightning]"
+          pip install pytest
+      - name: Run integration tests
+        env:
+          OMP_NUM_THREADS: "1"
+        run: |
+          # Aggregator, runtime, SDK, and root timing tests import torch.
+          pytest \
+            tests/aggregator \
+            tests/integrations \
+            tests/runtime \
+            tests/sdk \
+            tests/reporting/compare \
+            tests/reporting/html \
+            tests/reporting/summary \
+            tests/renderers \
+            tests/display \
+            tests/test_h2d_timing.py \
+            --basetemp="$RUNNER_TEMP/traceml-pytest" \
+            -q
+      - name: Check for orphaned DDP workers
+        if: always()
+        run: |
+          if pgrep -af '[e]xamples/distributed/ddp_minimal.py'; then
+            echo "A ddp_minimal.py worker remained after the DDP smoke run." >&2
+            exit 1
+          fi
+      - name: Upload integration failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-test-artifacts
+          path: ${{ runner.temp }}/traceml-pytest/**/logs/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+  test-rfdetr:
+    name: RF-DETR Integration (CPU and Gloo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install the supported RF-DETR release
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[torch,lightning]" "rfdetr[train]==1.10.1" pytest
+      - name: Run offline RF-DETR correctness and distributed tests
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          python -c 'import rfdetr.training; import torch; assert torch.distributed.is_gloo_available()'
+          pytest \
+            tests/integrations/test_rfdetr_trainer.py \
+            tests/integrations/test_rfdetr_auto_launch.py \
+            tests/integrations/test_rfdetr_nano.py -q
+
+  test-monai:
+    name: MONAI Integration (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install TraceML with the MONAI extra
+        # Pinned like test-rfdetr: a new MONAI or Ignite release must not
+        # turn every contributor's PR red. Unlike test-rfdetr, test-latest-deps
+        # does not install monai, so a new release gets no early warning here
+        # until it does.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[torch,monai]" "monai==1.6.*" "pytorch-ignite==0.5.*" \
+            nibabel pytest
+      - name: Report the resolved MONAI and Ignite versions
+        run: |
+          python -c 'import ignite, monai, torch; print("monai", monai.__version__, "ignite", ignite.__version__, "torch", torch.__version__)'
+      - name: Run MONAI integration tests
+        env:
+          OMP_NUM_THREADS: "1"
+        run: |
+          pytest tests/integrations/test_monai.py \
+            tests/integrations/test_monai_dataloading_example.py \
+            tests/integrations/test_telemetry_conformance.py -q
+      - name: Run the documented example end to end
+        # The guide promises this script reports all four phases, and that one
+        # TraceML step is one optimizer update. The tests above cannot see
+        # either: they stop at the rank side. The second run takes the
+        # accumulation path, where a step spans several iterations and the
+        # short last group of an epoch still publishes.
+        env:
+          OMP_NUM_THREADS: "1"
+        run: |
+          traceml run --run-name monai_plain \
+            examples/integrations/monai_minimal.py --args --epochs 1
+          traceml run --run-name monai_accumulated \
+            examples/integrations/monai_minimal.py \
+            --args --epochs 1 --accumulation-steps 3
+          python -c '
+          import json
+          import pathlib
+          import re
+          import sys
+
+          required = [
+              "input_wait_ms", "forward_ms", "backward_ms", "optimizer_ms"
+          ]
+          for name in sys.argv[1:]:
+              run = pathlib.Path("logs") / name
+              summary = json.loads((run / "final_summary.json").read_text())
+              average = summary["step_time"]["global"]["average"]
+              dark = [k for k in required if average.get(k) is None]
+              if dark:
+                  sys.exit(f"{name}: summary reports no {dark}; got {average}")
+              # A measured region cannot take exactly zero, so a zero here is
+              # a broken clock rather than a fast machine.
+              flat = [k for k in required if average[k] <= 0]
+              if flat:
+                  sys.exit(f"{name}: summary reports a zero {flat}; got {average}")
+              log = (run / "nodes/node_0/training.stdout.log").read_text()
+              printed = re.search(r"optimizer updates: ([0-9]+)", log)
+              if printed is None:
+                  sys.exit(f"{name}: the example printed no update count: {log}")
+              updates = int(printed.group(1))
+              steps = summary["step_time"]["metadata"]["training_total_steps"]
+              if steps != updates:
+                  sys.exit(
+                      f"{name}: {steps} published steps for {updates} "
+                      "optimizer updates"
+                  )
+              print(name, {k: round(average[k], 3) for k in required}, steps)
+          ' monai_plain monai_accumulated
+      - name: Rerun at the declared Ignite floor
+        # The floor in pyproject's monai extra, which is what MONAI's own
+        # "ignite" extra pins. Untested floors drift.
+        env:
+          OMP_NUM_THREADS: "1"
+        run: |
+          pip install "pytorch-ignite==0.4.11"
+          python -c 'import ignite; print("ignite", ignite.__version__)'
+          pytest tests/integrations/test_monai.py \
+            tests/integrations/test_monai_dataloading_example.py \
+            tests/integrations/test_telemetry_conformance.py -q
+
+  test-latest-deps:
+    name: Latest Dependencies (early warning)
+    # Not a pull-request gate. A brand new release of a dependency must not
+    # block contributors, but we want to hear about it before users do.
+    #
+    # Deliberately runs without setup-python's pip cache. The cache once
+    # held a locally source-built numpy-1.26.4-cp313-cp313-linux_x86_64
+    # wheel, which kept the `numpy<2` cap green on Python 3.13 in CI long
+    # after it had become uninstallable for anyone starting from a clean
+    # environment (issue #263). A resolution check must resolve for real.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # This job resolves and builds dependency versions that did not exist
+    # when the commit was written, so it executes third-party build code by
+    # design. Give it read-only scope and keep the checkout token out of the
+    # git config that build code could read.
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install with the newest resolvable dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir --upgrade --upgrade-strategy eager \
+            -e ".[torch]"
+          # tomli backports tomllib to 3.10 for the packaging guard.
+          pip install pytest 'tomli; python_version < "3.11"'
+      - name: Report the resolved environment
+        run: pip list
+      - name: Run core tests
+        run: |
+          pytest \
+            tests/core \
+            tests/diagnostics/test_bands.py \
+            tests/diagnostics/test_common.py \
+            tests/telemetry/test_distributed.py \
+            tests/telemetry/test_msgpack.py \
+            tests/telemetry/test_sender_sequence.py \
+            -q
+
+  smoke-test-install:
+    name: Clean-install Smoke Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.10"
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+      - name: Install the built wheel into a clean environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv smoke-env
+          # venv writes console scripts to Scripts/ on Windows, bin/ elsewhere.
+          bindir=smoke-env/Scripts
+          [ -d "$bindir" ] || bindir=smoke-env/bin
+          bindir=$(cd "$bindir" && pwd)
+          echo "SMOKE_BIN=$bindir" >> "$GITHUB_ENV"
+          "$bindir/python" -m pip install --upgrade pip
+          wheel_path=$(printf '%s\n' dist/*.whl)
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            # The Linux leg qualifies the packaged PyTorch launcher path.
+            "$bindir/python" -m pip install "${wheel_path}[torch]"
+          else
+            "$bindir/python" -m pip install "$wheel_path"
+          fi
+      - name: Assert documented CLI surface is installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_dir="$RUNNER_TEMP/traceml-install-smoke"
+          mkdir -p "$smoke_dir"
+          cd "$smoke_dir"
+          # Redirect instead of piping into grep: grep -q closes the pipe on
+          # first match, which makes the launcher exit non-zero and would hide
+          # its real status. set -e then catches a launcher that cannot start.
+          "$SMOKE_BIN/traceml" --help > root-help.txt
+          "$SMOKE_BIN/traceml" run --help > run-help.txt
+          grep -q 'view' root-help.txt || \
+            (echo "::error::traceml --help is missing the documented 'view' subcommand" && exit 1)
+          grep -q 'html-report' run-help.txt || \
+            (echo "::error::traceml run --help is missing the documented '--html-report' flag" && exit 1)
+      - name: Prepare the regression guard smoke workspace
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_dir="$RUNNER_TEMP/traceml-install-smoke"
+          mkdir -p "$smoke_dir"
+          cat > "$smoke_dir/traceml.yaml" <<'YAML'
+          mode: summary
+          history_enabled: true
+
+          guard:
+            schema_version: 1
+            workload:
+              name: ddp-minimal-guard-smoke
+              parameters:
+                data_version: synthetic-v1
+                model: tiny-mlp
+            measurement:
+              start_step: 1
+              completed_steps: 20
+          YAML
+      - name: Run the guarded reference training
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          OMP_NUM_THREADS: "1"
+        run: |
+          set -euo pipefail
+          smoke_dir="$RUNNER_TEMP/traceml-install-smoke"
+          cd "$smoke_dir"
+          "$SMOKE_BIN/traceml" run \
+            "$GITHUB_WORKSPACE/examples/distributed/ddp_minimal.py" \
+            --run-name guard-reference \
+            --logs-dir "$smoke_dir/logs" \
+            --nproc-per-node 2 \
+            --args --steps 20
+          test -f "$smoke_dir/logs/guard-reference/final_summary.json"
+      - name: Run the guarded candidate training
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          OMP_NUM_THREADS: "1"
+        run: |
+          set -euo pipefail
+          smoke_dir="$RUNNER_TEMP/traceml-install-smoke"
+          cd "$smoke_dir"
+          "$SMOKE_BIN/traceml" run \
+            "$GITHUB_WORKSPACE/examples/distributed/ddp_minimal.py" \
+            --run-name guard-candidate \
+            --logs-dir "$smoke_dir/logs" \
+            --nproc-per-node 2 \
+            --args --steps 20
+          test -f "$smoke_dir/logs/guard-candidate/final_summary.json"
+      - name: Compare the guarded runs
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_dir="$RUNNER_TEMP/traceml-install-smoke"
+          cd "$smoke_dir"
+          # This smoke test verifies the packaged workflow, not runner speed.
+          # Deterministic threshold boundaries are covered by unit tests.
+          "$SMOKE_BIN/traceml" compare \
+            logs/guard-reference/final_summary.json \
+            logs/guard-candidate/final_summary.json \
+            --max-step-time-regression-pct 1000000 \
+            --output compare/guard-reference-vs-candidate
+      - name: Verify the regression guard artifacts
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$SMOKE_BIN/python" - <<'PY'
+          import json
+          import math
+          import os
+          from pathlib import Path
+
+          smoke_dir = Path(os.environ["RUNNER_TEMP"]) / "traceml-install-smoke"
+          reference = smoke_dir / "logs/guard-reference/final_summary.json"
+          candidate = smoke_dir / "logs/guard-candidate/final_summary.json"
+          comparison = smoke_dir / "compare/guard-reference-vs-candidate.json"
+          comparison_text = comparison.with_suffix(".txt")
+
+          for path in (reference, candidate, comparison, comparison_text):
+              if not path.is_file():
+                  raise SystemExit(f"missing regression guard artifact: {path}")
+
+          payload = json.loads(comparison.read_text(encoding="utf-8"))
+          policy = payload.get("ci_policy")
+          if not isinstance(policy, dict):
+              raise SystemExit("comparison artifact is missing ci_policy")
+          if policy.get("result") != "WITHIN_THRESHOLD_IN_THIS_PAIR":
+              raise SystemExit(f"unexpected CI policy result: {policy.get('result')}")
+          for key in ("reference_step_time_ms", "candidate_step_time_ms"):
+              value = policy.get(key)
+              if (
+                  isinstance(value, bool)
+                  or not isinstance(value, (int, float))
+                  or not math.isfinite(value)
+                  or value <= 0
+              ):
+                  raise SystemExit(f"invalid {key}: {value!r}")
+          PY
+      - name: Upload regression guard failure artifacts
+        if: failure() && runner.os == 'Linux'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: regression-guard-smoke-artifacts
+          path: |
+            ${{ runner.temp }}/traceml-install-smoke/logs/**
+            ${{ runner.temp }}/traceml-install-smoke/compare/**
+          if-no-files-found: ignore
+          retention-days: 7
