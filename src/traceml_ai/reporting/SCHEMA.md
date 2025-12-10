@@ -1,0 +1,556 @@
+# Final Summary JSON
+
+TraceML writes one end-of-run JSON file. The current schema version is `1.9`.
+Each section has the same outer shape so the output is easy to store, diff, and
+consume from tooling.
+
+Schema `1.9` adds portable launcher context for local comparison and export.
+It retains the shared analysis window introduced in schema `1.8` and the
+canonical Step Time vocabulary introduced in schema `1.7`. Every public timing
+metric is nullable: `null` means the
+underlying timing signal was never measured in the analyzed window (missing
+instrumentation), while a measured zero stays `0.0`. Null metrics are
+excluded from `global.average`, `global.median`, and `global.worst` and from
+rank median/worst selection; a rank with only some metrics measured (for
+example an H2D-only rank) keeps its row with `null` for the others.
+
+For Step Time and Step Memory, `training_total_steps` is the highest observed
+completed-step counter (`0` with no steps), independent of retained row count.
+`training_latest_step` is that counter, or `null` with no steps. Completed steps
+are numbered from one. Earlier releases incorrectly added one to a nonempty
+counter; regenerated summaries correct this, including for older telemetry.
+This calculation was corrected during schema `1.8` without changing fields or
+types, so previously written `1.8` files may contain the older count. Those
+files are not modified.
+
+For user-facing definitions and examples, see the
+[Step Time glossary](../../../docs/user_guide/reading-output.md#step-time-glossary).
+
+Sections:
+
+- `system`: node-level CPU, RAM, GPU utilization, GPU memory, temperature,
+  power, and headroom.
+- `process`: process-level CPU, RSS, and GPU memory across global ranks.
+- `step_time`: aligned training-step timing across global ranks.
+- `step_memory`: aligned per-step peak allocated/reserved memory.
+
+## Top-Level Shape
+
+```json
+{
+  "schema_version": 1.9,
+  "generated_at": "...",
+  "duration_s": null,
+  "analysis_window": {
+    "anchor": "step_time | periodic_telemetry | null",
+    "retention_s": 1800.0,
+    "start_ts_s": null,
+    "end_ts_s": null,
+    "duration_s": null,
+    "start_step": null,
+    "end_step": null,
+    "sections": {
+      "system": {
+        "samples": 0,
+        "observed_start_ts_s": null,
+        "observed_end_ts_s": null
+      }
+    }
+  },
+  "meta": {
+    "run_name": null,
+    "mode": "single_node | multi_node | no_data",
+    "world_size": null,
+    "nodes_observed": null,
+    "gpus_observed": null
+  },
+  "run_context": {
+    "run": {
+      "status": "completed",
+      "profile": "run"
+    },
+    "declaration": {
+      "schema_version": 1,
+      "workload": {
+        "name": "resnet50-imagenet-training",
+        "parameters": {}
+      },
+      "measurement": {
+        "start_step": 10,
+        "completed_steps": 50
+      }
+    },
+    "execution": {
+      "expected_nodes": 1,
+      "processes_per_node": 2,
+      "expected_world_size": 2,
+      "launcher_completion": {
+        "status": "completed",
+        "nodes_observed": 1,
+        "reason_codes": []
+      }
+    }
+  },
+  "primary_diagnosis": {},
+  "system": {},
+  "process": {},
+  "step_time": {},
+  "step_memory": {},
+  "text": ""
+}
+```
+
+`analysis_window` is resolved once for the complete report. When Step Time is
+available, its latest optimizer step completed on every observed rank is the
+anchor; all common completed steps from the preceding retention duration set
+the snapped timestamp and step bounds. System and Process use those inclusive
+timestamp bounds, and Step Memory uses the same inclusive step bounds. Without
+Step Time, the latest System/Process timestamp anchors a time-only window and
+the step bounds remain `null`.
+
+Each section reports its sample count and observed timestamp bounds. The same
+analysis bounds also appear in every section's `metadata`.
+
+Retention advances through one shared frontier: the minimum of the latest
+rank-aligned Step Time step, latest rank-aligned Step Memory step, and the
+latest aligned step older than `retention_s`. Periodic telemetry is pruned
+through that step's completion timestamp.
+
+Top-level `duration_s` is full training lifecycle duration when genuine
+launcher start/end timestamps are available. Otherwise it is `null`; section
+or analysis-window durations are never substituted for the full run.
+
+`meta` contains run-level identity and observed topology. Section-level
+`metadata` remains section-specific coverage and metric-contract information.
+The terminal card labels a GPU count as observed only when it comes from
+`system.metadata.gpus_observed`; it does not assert that every observed GPU
+was used by the workload.
+
+`run_context` contains portable, run-scoped launcher facts already captured in
+`manifest.json`. The top-level field is always an object and may be empty when
+no readable launcher manifest is available. Its optional blocks are:
+
+- `run`: available training-command status and launch profile;
+- `declaration`: the normalized workload and measurement contract;
+- `execution`: expected launch topology and, when available, aggregate
+  launcher completion.
+
+`execution.expected_*` describes launch configuration.
+`launcher_completion.nodes_observed` counts launcher nodes whose outcome was
+readable, valid, and matched the current run; it is not telemetry-observed node
+coverage. Observed ranks, nodes, steps, and performance measurements remain in
+`meta` and the existing report sections. `declaration` is absent for ordinary
+runs, and `launcher_completion` is absent when guarded launcher outcomes were
+unavailable. An interrupted run may omit it because the aggregator can finish
+the summary before node 0 consolidates launcher outcomes. Malformed optional
+manifest values are omitted rather than replaced with zero or a successful
+status.
+
+`run_context.run.status` describes the supervised training command. It does
+not claim that telemetry or the declared measurement window is complete.
+
+The projection excludes internal session identifiers, paths, hostnames,
+addresses, ports, environment values, command arguments, contract digests,
+coordination timestamps, and individual node outcomes.
+
+`primary_diagnosis` is a top-level performance finding promoted from existing
+section diagnoses. It answers "why was training slow?" and is intentionally
+narrower than section-level health/resource diagnoses.
+
+`text` is a compact human-readable CLI/TXT card, not a parser contract. Run
+renders `Verdict`, `Why`, and `Next`, followed by fixed Step Timing/Step Memory
+and System/Process panes. Watch uses the same 156-column header, System/Process
+panes, scope legend, secondary findings, and footer, but omits the performance
+verdict and both step sections. A short `Next` line before the footer directs
+users to `trace_step(model)` and `traceml run` for step-time measurement. Its
+rank coverage comes from Process metadata;
+when that count is unavailable, grouped Process rows provide the observed
+count, and an empty Process section represents zero observed ranks rather than
+borrowing `meta.world_size`. System node coverage is resolved independently.
+Run rank and step coverage come from Step Time. The card uses only stored
+summary values: a distributed timing tree reads the rank at
+`global.median.step_time_ms.idx`, resource tables use stored average or
+median/worst points, and `Why` reads attributed culprit/victim rows. Values are
+not recomputed. Watch prints
+`Scope: N = node · R = global rank · G = GPU index` only when visible
+System/Process content uses one of those compact identities; Run retains its
+distributed scope legend. Normal resources leave the evidence row blank, and
+non-normal resources show compact stored evidence with the available scope.
+
+`text` is profile-aware: `traceml watch` renders only System and Process
+because Watch does not collect usable step timing. Detailed section prose
+remains in each section-local `card` field.
+
+## Primary Diagnosis Shape
+
+```json
+{
+  "kind": "INPUT_BOUND",
+  "status": "INPUT-BOUND",
+  "severity": "info | warn | crit",
+  "section": "step_time | system",
+  "scope": "performance",
+  "summary": "...",
+  "action": "...",
+  "evidence": {}
+}
+```
+
+`primary_diagnosis` is derived from already-built section payloads. It does not
+read telemetry tables or recompute diagnostics. Since schema `1.8`, Step Time
+diagnoses drive primary performance diagnosis. System GPU utilization is only
+supporting evidence, except for the fallback
+`LOW_GPU_UTILIZATION_UNEXPLAINED` when Step Time has no useful performance
+cause. Process, System health, and Step Memory health findings remain in their
+section diagnoses.
+
+Selection policy:
+
+- `INPUT_STRAGGLER`, `COMPUTE_STRAGGLER`, `H2D_STRAGGLER`, and `STRAGGLER`
+  use rank-comparison evidence and are promoted from `step_time.diagnosis`.
+- `RESIDUAL_HEAVY`, `INPUT_BOUND`, `H2D_BOUND`, and `COMPUTE_BOUND` use
+  phase-share evidence and are promoted from `step_time.diagnosis`.
+- `LOW_GPU_UTILIZATION_UNEXPLAINED` appears only when Step Time is `BALANCED`
+  and System reports `LOW_GPU_UTILIZATION` or `MODERATE_GPU_UTILIZATION`.
+- `NO_CLEAR_PERFORMANCE_BOTTLENECK` appears when Step Time is `BALANCED` and
+  GPU utilization is not low/moderate.
+- `INSUFFICIENT_STEP_TIME_DATA` appears when Step Time is `NO_DATA`,
+  `WARMUP`, or `INCOMPLETE_DATA`. For `INCOMPLETE_DATA` its summary and
+  action name the missing-phase problem, its evidence carries
+  `step_time_status: "INCOMPLETE DATA"`, and the Step Time section's
+  diagnosis evidence lists `missing_signals` plus per-signal
+  `signal_coverage`.
+- Step Time may emit warning-only bottleneck diagnoses before its confident
+  threshold; critical Step Time diagnoses require enough aligned steps.
+  Live and summary use the same global-rank Step Time SQLite window loader;
+  the summary is bounded by `analysis_window`, not by a row count, and does
+  not use a separate Step Time diagnosis gate.
+- Step Time diagnosis may consume advisory runtime training strategy context
+  when available. This does not add a public summary metric; missing or
+  unrecognized strategy metadata defaults to `ddp`. FSDP Step Time diagnosis
+  severity is capped at warning.
+
+Since schema `1.8`, high temperature, memory pressure, memory creep, high RSS,
+high CPU, and other resource-health findings are not promoted into
+`primary_diagnosis`. They remain available under their section's `diagnosis`
+and `issues`.
+
+Primary diagnosis evidence uses a small union:
+
+```json
+{
+  "type": "phase_share",
+  "basis": "average",
+  "steps_analyzed": 256,
+  "input_wait_ms": 80.0,
+  "step_time_ms": 240.0,
+  "traced_step_time_ms": 160.0,
+  "diagnosis_clock": "gpu",
+  "dataloader_fetch_cpu_ms": 40.0,
+  "h2d_ms": 0.4,
+  "compute_ms": 120.0,
+  "residual_ms": 39.6,
+  "score": 0.333,
+  "score_basis": "median_per_rank_step_time_share",
+  "score_denominator": "selected-clock Step Time per rank",
+  "gpu_util_avg_percent": 37.8
+}
+```
+
+`phase_share` is used for `INPUT_BOUND`, `H2D_BOUND`, `RESIDUAL_HEAVY`, and
+`COMPUTE_BOUND`. Millisecond values come from `step_time.global.average` and
+are supporting observations only. For scored typical bottlenecks, `score` is
+the authoritative median per-rank Step Time fraction. Informational
+`COMPUTE_BOUND` uses the median per-rank
+`(forward_ms + backward_ms + optimizer_ms) / step_time_ms` share with a
+90% threshold, but has no score because it is excluded from impact-based
+primary ordering.
+
+```json
+{
+  "type": "rank_comparison",
+  "metric": "input_wait_ms",
+  "phase": "input",
+  "steps_analyzed": 256,
+  "median": {"rank": 0, "value_ms": 0.7},
+  "worst": {"rank": 2, "value_ms": 180.9},
+  "delta_ms": 180.2,
+  "ratio": 262.4,
+  "gpu_util_avg_percent": 80.0
+}
+```
+
+`rank_comparison` is used for `INPUT_STRAGGLER`, `COMPUTE_STRAGGLER`,
+`H2D_STRAGGLER`, and `STRAGGLER`. Values come from `step_time.global` rank
+summaries. Generic `STRAGGLER` may contain a `comparisons` array instead of a
+single metric comparison.
+
+Fallback evidence types are:
+
+- `utilization_fallback` for `LOW_GPU_UTILIZATION_UNEXPLAINED`
+- `no_clear_bottleneck` for `NO_CLEAR_PERFORMANCE_BOTTLENECK`
+- `insufficient_data` for `INSUFFICIENT_STEP_TIME_DATA`
+
+## Section Shape
+
+```json
+{
+  "metadata": {
+    "mode": "single_node | multi_node | no_data",
+    "duration_s": null,
+    "samples": null,
+    "nodes_expected": null,
+    "nodes_observed": null,
+    "nodes_coverage": null,
+    "nodes_partial": null,
+    "gpus_observed": null,
+    "global_ranks_seen": null,
+    "global_ranks_used": null,
+    "training_total_steps": null,
+    "training_latest_step": null,
+    "section_metric_names": [],
+    "analysis_start_ts_s": null,
+    "analysis_end_ts_s": null,
+    "analysis_start_step": null,
+    "analysis_end_step": null
+  },
+  "diagnosis": {
+    "kind": "...",
+    "status": "...",
+    "severity": "info | warn | crit",
+    "summary": "...",
+    "action": "...",
+    "metric": null,
+    "phase": null,
+    "score": null,
+    "share_pct": null,
+    "skew_pct": null,
+    "ranks": [],
+    "evidence": {}
+  },
+  "issues": [
+    {
+      "kind": "...",
+      "status": "...",
+      "severity": "info | warn | crit",
+      "summary": "...",
+      "action": "...",
+      "metric": null,
+      "phase": null,
+      "score": null,
+      "share_pct": null,
+      "skew_pct": null,
+      "ranks": [],
+      "evidence": {}
+    }
+  ],
+  "global": {
+    "index_by": "node_rank | global_rank",
+    "window": {
+      "kind": "sample_window | step_window",
+      "alignment": "none | common_steps",
+      "samples": null,
+      "steps_analyzed": null,
+      "start_step": null,
+      "end_step": null,
+      "completed_step": null,
+      "diagnosis_clock": "cpu | gpu"
+    },
+    "average": {"<metric_name>": null},
+    "median": {"<metric_name>": {"value": null, "idx": null}},
+    "worst": {"<metric_name>": {"value": null, "idx": null}}
+  },
+  "groups": {
+    "by": "node_rank | global_rank",
+    "rows": {
+      "0": {
+        "identity": {
+          "global_rank": null,
+          "local_rank": null,
+          "node_rank": null,
+          "hostname": null,
+          "local_world_size": null,
+          "world_size": null
+        },
+        "metrics": {"<metric_name>": null}
+      }
+    }
+  },
+  "units": {},
+  "card": ""
+}
+```
+
+## Field Rules
+
+- `issues` is the canonical sorted list of diagnostic findings or states.
+- `issues` is always non-empty.
+- `diagnosis` is always equal to `issues[0]`.
+- Neutral states such as `NORMAL`, `BALANCED`, `NO_DATA`, `WARMUP`, and
+  `NO_GPU` are represented with the same issue shape as actionable findings.
+- `kind` is the stable internal key for code, comparisons, and frontend logic.
+- `status` is the user-facing display label.
+- `summary` is the short explanation. Older `reason` fields should be treated
+  as pre-`1.4` input, not the current final-summary contract.
+- `score` is an optional section-specific ranking signal. In Step Time, scored
+  typical bottlenecks use median per-rank Step Time impact and stragglers use
+  visible wait cost divided by victim Step Time.
+- Section-specific details such as `scope`, `samples_used`, `steps_used`,
+  `note`, and `confidence` belong in `evidence`.
+- `groups.rows` contains row data only: `identity` and `metrics`.
+- Row-level diagnosis is intentionally omitted for now.
+- `global.average`, `global.median`, `global.worst`, and
+  `groups.rows[*].metrics` must use exactly `metadata.section_metric_names`.
+  Keys are always present; a Step Time metric whose signal was never
+  measured carries `null` (`{"value": null, "idx": null}` for rank points)
+  and never a fabricated `0.0`.
+- `global.index_by` must match `groups.by`.
+- `idx` points to a key in `groups.rows`.
+- `metadata.global_ranks_seen` is all observed ranks.
+- `metadata.global_ranks_used` is the ranks included in `groups.rows` and the
+  `global` comparison.
+- `card` is the section-local detailed text block used by section tooling and
+  retained in JSON even when top-level `text` uses the compact verdict report.
+
+`step_time` and `step_memory` use `common_steps` alignment. If a rank does not
+have the common step window, it can be counted in `global_ranks_seen` but not
+in `global_ranks_used`.
+
+The distributed Run card resolves
+`step_time.global.median.step_time_ms.idx` to one grouped row and reads all
+displayed phases from that row. Its upper-pane Step Memory table reads
+the median and worst reserved-memory point indexes and reads Allocated and
+Reserved from each selected grouped row. If a reserved-memory selector is
+unavailable, the corresponding allocated-memory point selects the row.
+All displayed values remain averages of per-step peaks over the aligned
+window. These are presentation selection rules; they do not add aggregates to
+the schema.
+
+`system` and `process` may contain different sample counts from Step Time, but
+their inclusive timestamp bounds come from the same `analysis_window`.
+The Process table reads RSS and CUDA-reserved byte/percentage pairs from one
+grouped rank row, anchored by the stored percentage point with the byte point
+as a null-percentage fallback. These are presentation selection rules and do
+not create new aggregates or diagnoses.
+
+## Metric Names
+
+```json
+{
+  "system": [
+    "cpu_percent",
+    "ram_bytes",
+    "ram_percent",
+    "gpu_util_percent",
+    "gpu_mem_bytes",
+    "gpu_mem_percent",
+    "gpu_temp_c",
+    "gpu_power_w",
+    "gpu_headroom_bytes"
+  ],
+  "process": [
+    "cpu_percent",
+    "cpu_capacity_percent",
+    "ram_bytes",
+    "ram_percent",
+    "gpu_mem_used_bytes",
+    "gpu_mem_reserved_bytes",
+    "gpu_mem_reserved_percent",
+    "gpu_mem_headroom_bytes"
+  ],
+  "step_time": [
+    "input_wait_ms",
+    "step_time_ms",
+    "traced_step_time_ms",
+    "step_time_cpu_ms",
+    "step_time_gpu_ms",
+    "traced_step_time_cpu_ms",
+    "traced_step_time_gpu_ms",
+    "dataloader_fetch_cpu_ms",
+    "h2d_ms",
+    "compute_ms",
+    "residual_ms",
+    "forward_ms",
+    "backward_ms",
+    "optimizer_ms"
+  ],
+  "step_memory": [
+    "peak_allocated_bytes",
+    "peak_reserved_bytes"
+  ]
+}
+```
+
+Metric suffixes are units:
+
+- `_bytes`
+- `_ms`
+- `_percent`
+- `_c`
+- `_w`
+
+## Step Time Residual
+
+Step Time uses one selected clock per aligned window. GPU timing is used when
+the window has complete GPU event timings; otherwise explicit CPU timing is
+used. `input_wait_ms`, `step_time_ms`, and `traced_step_time_ms` expose
+selected-clock values. The four explicit aggregate fields preserve both clocks:
+
+```text
+step_time_cpu_ms
+step_time_gpu_ms
+traced_step_time_cpu_ms
+traced_step_time_gpu_ms
+```
+
+The clock-qualified relationships are:
+
+```text
+CPU Step Time = CPU Input Wait + CPU Traced Step Time
+GPU Step Time = GPU Input Wait + GPU Traced Step Time
+```
+
+The summary publishes the selected Input Wait as `input_wait_ms`; CPU and GPU
+Input Wait are not additional summary fields. The explicit Step Time and Traced
+Step Time aggregates above retain the corresponding clock-qualified values.
+
+`dataloader_fetch_cpu_ms` is supplemental CPU DataLoader-fetch evidence. It
+is never added into Input Wait or Step Time and has no phase-share percentage.
+Every displayed phase share uses the selected `step_time_ms` denominator.
+Those table shares are observational averages and may differ from the
+authoritative median per-rank diagnosis `score`.
+
+When GPU is selected, `input_wait_ms` is GPU-clocked while
+`dataloader_fetch_cpu_ms` remains CPU evidence, so they can differ. When CPU
+is selected they describe the same CPU input-wait interval; neither is counted
+twice.
+
+`residual_ms` is residual unattributed step time. It is averaged from
+per-step clamped residuals, not recomputed from already-averaged phase totals:
+
+```text
+compute_ms = forward_ms + backward_ms + optimizer_ms
+known_step_ms = h2d_ms + compute_ms
+traced_step_time_ms = selected traced envelope timing
+step_time_ms = selected input_wait_ms + selected traced_step_time_ms
+residual_ms = average(max(0, traced_step_time_ms - known_step_ms))
+```
+
+The selected-clock diagnosis contract is:
+
+```text
+input_wait_ms = selected-clock input wait
+traced_step_time_ms = selected-clock Traced Step Time
+step_time_ms = complete selected-clock step duration
+diagnosis_clock = "cpu" | "gpu"
+```
+
+Since schema `1.8`, summaries do not publish historical timing aliases. Readers
+that support older summary files must use an explicit schema-versioned
+compatibility adapter at their input boundary; new output remains canonical.
+
+`duration_ms` is stored compatibility timing and is not a Step Time display or
+diagnosis fallback. `residual_ms` can include validation, checkpointing,
+logging, framework orchestration, CPU stalls, unobserved transfer stalls, or
+other work outside the traced H2D and compute phases. Do not treat it as NCCL,
+all-reduce, or synchronization overhead without profiler evidence.
