@@ -1,0 +1,332 @@
+# Copyright 2026 OptAI UG (haftungsbeschraenkt)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# SPDX-License-Identifier: Apache-2.0
+
+import io
+import logging
+
+import pytest
+
+from traceml_ai.runtime.sender import SenderIdentity, TelemetryPublisher
+
+
+class _FakeLogger:
+    def __init__(self) -> None:
+        self.exceptions: list[tuple[str, tuple[object, ...]]] = []
+        self.errors: list[str] = []
+
+    def exception(self, message: str, *args: object) -> None:
+        formatted = message % args if args else message
+        self.exceptions.append((formatted, args))
+
+    def error(self, message: str) -> None:
+        self.errors.append(message)
+
+
+class _FakeTCPClient:
+    def __init__(
+        self,
+        *,
+        fail_send: bool = False,
+        fail_close: bool = False,
+    ) -> None:
+        self.fail_send = fail_send
+        self.fail_close = fail_close
+        self.sent_batches: list[list[object]] = []
+        self.closed = False
+
+    def send_batch(self, payloads: list[object]) -> None:
+        if self.fail_send:
+            raise RuntimeError("send failed")
+        self.sent_batches.append(payloads)
+
+    def close(self) -> None:
+        if self.fail_close:
+            raise RuntimeError("close failed")
+        self.closed = True
+
+
+class _AttachRejectingSender:
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "sender":
+            raise RuntimeError("attach failed")
+        super().__setattr__(name, value)
+
+    def collect_payload(self) -> object | None:
+        return None
+
+
+class _FakeWriter:
+    def __init__(self, *, fail_flush: bool = False) -> None:
+        self.fail_flush = fail_flush
+        self.flush_count = 0
+
+    def flush(self) -> None:
+        self.flush_count += 1
+        if self.fail_flush:
+            raise RuntimeError("flush failed")
+
+
+class _FakeDB:
+    def __init__(self, writer: _FakeWriter) -> None:
+        self.writer = writer
+
+
+class _FakeSender:
+    def __init__(
+        self,
+        payload: object | None,
+        *,
+        fail_collect: bool = False,
+    ) -> None:
+        self.payload = payload
+        self.fail_collect = fail_collect
+        self.sender = None
+        self.rank = None
+        self.identity = None
+        self.collect_count = 0
+
+    def collect_payload(self) -> object | None:
+        self.collect_count += 1
+        if self.fail_collect:
+            raise RuntimeError("collect failed")
+        return self.payload
+
+
+class _FakeSampler:
+    def __init__(
+        self,
+        name: str,
+        *,
+        sender: _FakeSender | None = None,
+        writer: _FakeWriter | None = None,
+    ) -> None:
+        self.sampler_name = name
+        self.sender = sender
+        self.db = _FakeDB(writer) if writer is not None else None
+
+
+def _payload(sampler: str) -> dict:
+    return {
+        "meta": {
+            "rank": 0,
+            "global_rank": 0,
+            "local_rank": 0,
+            "world_size": 1,
+            "local_world_size": 1,
+            "node_rank": 0,
+            "hostname": "",
+            "pid": 0,
+            "sampler": sampler,
+            "timestamp": 1.0,
+        },
+        "body": {"tables": {"rows": [{"v": 1}]}},
+    }
+
+
+def test_publisher_attaches_senders_to_tcp_client_and_rank() -> None:
+    tcp_client = _FakeTCPClient()
+    sender = _FakeSender(payload={"rows": [1]})
+    sampler = _FakeSampler("SamplerA", sender=sender)
+    publisher = TelemetryPublisher(
+        tcp_client=tcp_client,
+        identity=SenderIdentity(global_rank=3, local_rank=3),
+        logger=_FakeLogger(),
+    )
+
+    publisher.attach_senders([sampler])
+
+    assert sender.sender is tcp_client
+    assert sender.rank is None
+    assert sender.identity == SenderIdentity(global_rank=3, local_rank=3)
+
+
+def test_publisher_logs_sender_attach_failures_and_continues() -> None:
+    tcp_client = _FakeTCPClient()
+    logger = _FakeLogger()
+    bad_sender = _AttachRejectingSender()
+    good_sender = _FakeSender(payload={"rows": [1]})
+    bad_sampler = _FakeSampler("BadSampler", sender=bad_sender)
+    good_sampler = _FakeSampler("GoodSampler", sender=good_sender)
+    publisher = TelemetryPublisher(
+        tcp_client=tcp_client,
+        identity=SenderIdentity(global_rank=2, local_rank=2),
+        logger=logger,
+    )
+
+    publisher.attach_senders([bad_sampler, good_sampler])
+
+    assert good_sender.sender is tcp_client
+    assert good_sender.rank is None
+    assert len(logger.errors) == 1
+    assert "sender attach failed" in logger.errors[0]
+    assert "RuntimeError: attach failed" in logger.errors[0]
+
+
+def test_publisher_flushes_collects_and_sends_one_batch() -> None:
+    tcp_client = _FakeTCPClient()
+    writer = _FakeWriter()
+    sampler_a = _FakeSampler(
+        "SamplerA",
+        sender=_FakeSender(payload=_payload("a")),
+        writer=writer,
+    )
+    sampler_b = _FakeSampler(
+        "SamplerB",
+        sender=_FakeSender(payload=None),
+    )
+    publisher = TelemetryPublisher(
+        tcp_client=tcp_client,
+        identity=SenderIdentity(global_rank=0, local_rank=0),
+        logger=_FakeLogger(),
+    )
+
+    publisher.publish([sampler_a, sampler_b])
+
+    assert writer.flush_count == 1
+    assert tcp_client.sent_batches == [[_payload("a")]]
+
+
+def test_publisher_collects_empty_mapping_payloads() -> None:
+    tcp_client = _FakeTCPClient()
+    sampler = _FakeSampler(
+        "SamplerA",
+        sender=_FakeSender(payload={}),
+    )
+    publisher = TelemetryPublisher(
+        tcp_client=tcp_client,
+        identity=SenderIdentity(global_rank=0, local_rank=0),
+        logger=_FakeLogger(),
+    )
+
+    publisher.publish([sampler])
+
+    assert tcp_client.sent_batches == [[{}]]
+
+
+def test_publisher_does_not_send_empty_batch() -> None:
+    tcp_client = _FakeTCPClient()
+    sampler = _FakeSampler(
+        "SamplerA",
+        sender=_FakeSender(payload=None),
+    )
+    publisher = TelemetryPublisher(
+        tcp_client=tcp_client,
+        identity=SenderIdentity(global_rank=0, local_rank=0),
+        logger=_FakeLogger(),
+    )
+
+    publisher.publish([sampler])
+
+    assert tcp_client.sent_batches == []
+
+
+def test_publisher_logs_failures_and_continues() -> None:
+    tcp_client = _FakeTCPClient(fail_send=True)
+    logger = _FakeLogger()
+    good_sampler = _FakeSampler(
+        "GoodSampler",
+        sender=_FakeSender(payload=_payload("good")),
+        writer=_FakeWriter(),
+    )
+    bad_flush_sampler = _FakeSampler(
+        "BadFlushSampler",
+        sender=_FakeSender(payload=_payload("bad_flush")),
+        writer=_FakeWriter(fail_flush=True),
+    )
+    bad_collect_sampler = _FakeSampler(
+        "BadCollectSampler",
+        sender=_FakeSender(payload=None, fail_collect=True),
+    )
+    publisher = TelemetryPublisher(
+        tcp_client=tcp_client,
+        identity=SenderIdentity(global_rank=0, local_rank=0),
+        logger=logger,
+    )
+
+    publisher.publish([good_sampler, bad_flush_sampler, bad_collect_sampler])
+
+    messages = logger.errors
+    assert len(messages) == 3
+    assert any("writer.flush failed" in message for message in messages)
+    assert any("collect_payload failed" in message for message in messages)
+    assert any("send_batch failed" in message for message in messages)
+
+
+def test_publisher_close_delegates_to_tcp_client() -> None:
+    tcp_client = _FakeTCPClient()
+    publisher = TelemetryPublisher(
+        tcp_client=tcp_client,
+        identity=SenderIdentity(global_rank=0, local_rank=0),
+        logger=_FakeLogger(),
+    )
+
+    publisher.close()
+
+    assert tcp_client.closed is True
+
+
+def test_publisher_close_failure_is_logged_not_raised() -> None:
+    tcp_client = _FakeTCPClient(fail_close=True)
+    logger = _FakeLogger()
+    publisher = TelemetryPublisher(
+        tcp_client=tcp_client,
+        identity=SenderIdentity(global_rank=0, local_rank=0),
+        logger=logger,
+    )
+
+    publisher.close()
+
+    assert len(logger.errors) == 1
+    assert "TCPClient.close failed" in logger.errors[0]
+    assert "RuntimeError: close failed" in logger.errors[0]
+
+
+def test_publisher_supports_an_error_only_logger() -> None:
+    class _ErrorOnlyLogger:
+        def __init__(self) -> None:
+            self.errors: list[str] = []
+
+        def error(self, message: str) -> None:
+            self.errors.append(message)
+
+    logger = _ErrorOnlyLogger()
+    publisher = TelemetryPublisher(
+        tcp_client=_FakeTCPClient(fail_send=True),
+        identity=SenderIdentity(global_rank=0, local_rank=0),
+        logger=logger,
+    )
+
+    publisher.send_batch([{"rows": [1]}])
+
+    assert len(logger.errors) == 1
+    assert "TCPClient.send_batch failed" in logger.errors[0]
+
+
+def test_cleanup_log_excludes_an_active_user_exception() -> None:
+    stream = io.StringIO()
+    logger = logging.Logger("test-publisher-cleanup")
+    logger.setLevel(logging.ERROR)
+    logger.addHandler(logging.StreamHandler(stream))
+    publisher = TelemetryPublisher(
+        tcp_client=_FakeTCPClient(),
+        identity=SenderIdentity(global_rank=0, local_rank=0),
+        logger=logger,
+    )
+    sampler = _FakeSampler(
+        "BrokenSampler",
+        writer=_FakeWriter(fail_flush=True),
+    )
+
+    with pytest.raises(ValueError, match="private user failure"):
+        try:
+            raise ValueError("private user failure")
+        finally:
+            publisher.flush_writers([sampler])
+
+    content = stream.getvalue()
+    assert "BrokenSampler.writer.flush failed" in content
+    assert "RuntimeError: flush failed" in content
+    assert "private user failure" not in content
