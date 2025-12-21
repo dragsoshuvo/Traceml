@@ -1,0 +1,146 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "traceml-ai"
+dynamic = ["version"]
+
+description = "TraceML: Lightweight runtime bottleneck diagnostics for PyTorch training."
+authors = ["Margot Ellwood"]
+maintainers = [{ name = "OptAI UG (haftungsbeschränkt)", email = "support@traceopt.ai" }]
+readme = "README.md"
+license = { text = "Apache 2.0" }
+requires-python = ">=3.10"
+
+keywords = [
+    "pytorch",
+    "profiler",
+    "gpu",
+    "training",
+    "bottleneck",
+    "cuda",
+    "dataloader",
+    "observability",
+    "machine-learning",
+    "deep-learning",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+
+
+# Runtime dependencies
+dependencies = [
+    "rich>=12.0.0",
+    "psutil>=5.0.0",
+    "nvidia-ml-py",
+    "numpy>=1.26",
+    "msgspec",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+
+dashboard = [
+    # The dashboard calls ui.context, added in NiceGUI 1.4.23. Older
+    # releases import successfully but fail when the dashboard starts.
+    "nicegui>=1.4.23",
+]
+
+torch = [
+    "torch>=2.5.0",
+    "torchvision>=0.20.0",
+]
+dev = [
+    # Keep these three equal to the revs in .pre-commit-config.yaml, which
+    # is what CI's lint job runs. A newer local formatter reformats files
+    # that CI considers clean.
+    "black==26.5.1",
+    "ruff==0.15.22",
+    "isort==9.0.1",
+    "pre-commit",
+    "codespell>=2.4.1",
+    "nbstripout",
+    "pytest>=8.0.0",
+    "coverage>=7.10.5",
+    "pytest-cov>=7.0.0",
+    "datasets",
+    "transformers",
+    'tomli; python_version < "3.11"',
+]
+
+hf = [
+    "transformers>=4.46.1",
+    "accelerate>=0.26.0",
+]
+
+lightning = [
+    "lightning>=2.6.0",
+]
+
+monai = [
+    # The handler repeats MONAI 1.6.0's gradient-accumulation step rule.
+    "monai>=1.6.0",
+    # The Ignite release MONAI 1.6.0's own "ignite" extra pins.
+    "pytorch-ignite>=0.4.11",
+]
+
+ray = [
+    "ray[train]>=2.0.0",
+]
+
+deepspeed = [
+    "deepspeed>=0.10.0",
+]
+
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.26",
+    # mkdocstrings 1.0.6 does not support pymdown-extensions 12.2 yet.
+    "pymdown-extensions<12.2",
+    "mkdocs-autorefs>=1.2",
+    "mkdocs-include-markdown-plugin>=7.0",
+]
+
+
+[tool.isort]
+profile = "black"
+line_length = 79
+
+[tool.black]
+line-length = 79
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 79
+
+[project.scripts]
+traceml = "traceml_ai.launcher.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# Offline-bundled dashboard fonts must ship in the wheel (served at runtime by
+# the NiceGUI driver); without this they fall back to the system font stack.
+traceml_ai = ["aggregator/display_drivers/assets/fonts/*.woff2"]
+
+[tool.setuptools_scm]
+# Version is derived from the nearest git tag (e.g. v0.3.4) instead of a
+# hand-maintained string, so a release tag and the built package can no
+# longer drift apart. Written to a generated file read by __init__.py.
+version_file = "src/traceml_ai/_version.py"
