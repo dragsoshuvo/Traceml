@@ -1,0 +1,68 @@
+default_stages: [pre-commit, pre-push, manual]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        exclude: ^mkdocs\.yml$
+      - id: check-toml
+      - id: check-ast
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+      - id: detect-private-key
+      - id: debug-statements
+      - id: no-commit-to-branch
+        stages: [pre-commit]
+        args: [--branch, main]
+
+  - repo: https://github.com/PyCQA/isort
+    rev: 9.0.1
+    hooks:
+      - id: isort
+        files: ^(src/|dev/|docs/)
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.22
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ^(src/|dev/|docs/)
+
+  - repo: https://github.com/psf/black
+    rev: 26.5.1
+    hooks:
+      - id: black-jupyter
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        args: ["--ignore-words-list", "traceml,deques"]
+
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.8.1
+    hooks:
+      - id: nbstripout
+        args: ["--keep-output"]
+
+  - repo: local
+    hooks:
+      - id: mkdocs-build
+        name: mkdocs build --strict
+        entry: mkdocs build --strict --quiet
+        language: system
+        pass_filenames: false
+        files: ^(docs/|mkdocs\.yml|src/)
+        stages: [pre-push]
+
+      - id: block-workflow-artifacts
+        name: block AI / workflow artifacts from being committed
+        entry: .git-hooks/block-workflow-artifacts.sh
+        language: system
+        stages: [pre-commit]
