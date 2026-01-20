@@ -1,0 +1,329 @@
+"""
+traceml.yaml config loader.
+
+Precedence: CLI flag > TRACEML_* env var > traceml.yaml > built-in default.
+
+Only imported by the launcher. Child processes (executor, aggregator) receive
+already-resolved TRACEML_* env vars and never read this file.
+
+Scope: this loader governs the UI/telemetry settings that have no dedicated
+launch-config owner. Distributed and run-identity settings (nproc/nnodes,
+node rank, master + aggregator addresses, run name/session id, and trace step
+cap) are configured through CLI flags and the typed launch configs
+in ``traceml_ai.launcher.launch_config``.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import warnings
+from pathlib import Path
+from typing import Any, Mapping
+
+from traceml_ai.runtime.settings import (
+    DEFAULT_FINALIZE_TIMEOUT_SEC,
+    DEFAULT_INTERVAL_SEC,
+    DEFAULT_UI_MODE,
+)
+from traceml_ai.telemetry.retention import (
+    DEFAULT_HISTORY_RETENTION_S,
+    parse_history_retention,
+)
+
+_log = logging.getLogger(__name__)
+
+CONFIG_FILENAME = "traceml.yaml"
+GUARD_CONFIG_KEY = "guard"
+
+# Max parent dirs to search upward for traceml.yaml.
+_MAX_WALK_LEVELS = 10
+
+# Schema: yaml key → (TRACEML_* env var, expected type).
+# To add a setting: add here, add to BUILT_IN_DEFAULTS, add default=None in cli.py.
+YAML_KEY_SCHEMA: dict[str, tuple[str, type]] = {
+    "mode": ("TRACEML_UI_MODE", str),
+    # This is the one public cadence control: sampler frequency on workers and
+    # UI refresh frequency on the aggregator. TCP ingestion remains event-driven.
+    "interval": ("TRACEML_INTERVAL", float),
+    "enable_logging": ("TRACEML_ENABLE_LOGGING", bool),
+    "logs_dir": ("TRACEML_LOGS_DIR", str),
+    "history_enabled": ("TRACEML_HISTORY_ENABLED", bool),
+    "history_retention": ("TRACEML_HISTORY_RETENTION", float),
+    "finalize_timeout_sec": ("TRACEML_FINALIZE_TIMEOUT_SEC", float),
+    "dashboard_port": ("TRACEML_DASHBOARD_PORT", int),
+    "dashboard_auto_open": ("TRACEML_DASHBOARD_AUTO_OPEN", bool),
+}
+
+# Fallback values used when no CLI flag, env var, or yaml entry is present.
+BUILT_IN_DEFAULTS: dict[str, Any] = {
+    "mode": DEFAULT_UI_MODE,
+    "interval": DEFAULT_INTERVAL_SEC,
+    "enable_logging": False,
+    "logs_dir": "./logs",
+    "history_enabled": True,
+    "history_retention": DEFAULT_HISTORY_RETENTION_S,
+    "finalize_timeout_sec": DEFAULT_FINALIZE_TIMEOUT_SEC,
+    "dashboard_port": 8765,
+    "dashboard_auto_open": True,
+}
+
+# Env var strings treated as True for bool fields.
+_BOOL_ENV_TRUE = frozenset({"1", "true", "yes"})
+
+_POSITIVE_FLOAT_KEYS = frozenset({"finalize_timeout_sec"})
+
+
+def is_finite_positive(value: float) -> bool:
+    number = float(value)
+    return math.isfinite(number) and number > 0.0
+
+
+def find_config_file(start_dir: Path) -> Path | None:
+    """Walk up from *start_dir* looking for traceml.yaml. Returns None if not found."""
+    current = start_dir.resolve()
+    for _ in range(_MAX_WALK_LEVELS):
+        candidate = current / CONFIG_FILENAME
+        if candidate.is_file():
+            _log.debug("[TraceML] Found config file: %s", candidate)
+            return candidate
+        parent = current.parent
+        if parent == current:
+            break  # filesystem root
+        current = parent
+    return None
+
+
+def _reject_duplicate_guard_keys(yaml: Any, source: str, path: Path) -> None:
+    """Reject duplicate keys in the effective guard mapping only."""
+    loader = yaml.SafeLoader(source)
+    try:
+        root = loader.get_single_node()
+        if not isinstance(root, yaml.nodes.MappingNode):
+            return
+
+        # Resolve top-level YAML merges before locating guard. Ordinary keys
+        # remain permissive; strictness belongs only to the run guard contract.
+        loader.flatten_mapping(root)
+        guard_nodes = [
+            value_node
+            for key_node, value_node in root.value
+            if isinstance(key_node, yaml.nodes.ScalarNode)
+            and key_node.tag == "tag:yaml.org,2002:str"
+            and key_node.value == GUARD_CONFIG_KEY
+        ]
+        if len(guard_nodes) > 1:
+            line = guard_nodes[1].start_mark.line + 1
+            raise ValueError(
+                f"{path}: duplicate top-level guard key at line {line}"
+            )
+        if not guard_nodes:
+            return
+
+        visited: set[int] = set()
+
+        def walk(node: Any) -> None:
+            if id(node) in visited:
+                return
+            visited.add(id(node))
+
+            if isinstance(node, yaml.nodes.MappingNode):
+                loader.flatten_mapping(node)
+                seen: set[tuple[str, str]] = set()
+                for key_node, value_node in node.value:
+                    if isinstance(key_node, yaml.nodes.ScalarNode):
+                        key = (key_node.tag, key_node.value)
+                        if key in seen:
+                            line = key_node.start_mark.line + 1
+                            raise ValueError(
+                                f"{path}: duplicate key in guard "
+                                f"declaration at line {line}"
+                            )
+                        seen.add(key)
+                    walk(value_node)
+            elif isinstance(node, yaml.nodes.SequenceNode):
+                for value_node in node.value:
+                    walk(value_node)
+
+        walk(guard_nodes[0])
+    finally:
+        loader.dispose()
+
+
+def load_yaml_config(
+    path: Path, *, reject_guard_duplicates: bool = False
+) -> dict[str, Any]:
+    """Parse traceml.yaml, optionally rejecting duplicates inside guard.
+
+    Ordinary settings retain PyYAML's historical last-value behavior.
+    """
+    try:
+        import yaml  # noqa: PLC0415 — intentional late import
+    except ImportError:
+        warnings.warn(
+            "[TraceML] pyyaml is not installed; traceml.yaml will be ignored. "
+            "Install it with: pip install pyyaml",
+            stacklevel=2,
+        )
+        return {}
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        if reject_guard_duplicates:
+            _reject_duplicate_guard_keys(yaml, source, path)
+        raw = yaml.safe_load(source)
+    except OSError as exc:
+        raise OSError(
+            f"[TraceML] Cannot read config file {path}: {exc}"
+        ) from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"[TraceML] {path}: YAML syntax error — {exc}"
+        ) from exc
+
+    if raw is None:
+        return {}  # empty file
+
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"[TraceML] {path}: expected a YAML mapping at the top level, "
+            f"got {type(raw).__name__}"
+        )
+
+    result: dict[str, Any] = {}
+    for key, value in raw.items():
+        # The run launcher validates this nested declaration. Other consumers
+        # share traceml.yaml but intentionally ignore guard semantics.
+        if key == GUARD_CONFIG_KEY:
+            result[key] = value
+            continue
+        if key not in YAML_KEY_SCHEMA:
+            warnings.warn(
+                f"[TraceML] {path}: unknown config key '{key}' — ignored.",
+                stacklevel=2,
+            )
+            continue
+        _, expected_type = YAML_KEY_SCHEMA[key]
+        result[key] = _validate_and_coerce(key, value, expected_type, path)
+
+    return result
+
+
+def _validate_and_coerce(
+    key: str, value: Any, expected_type: type, path: Path
+) -> Any:
+    """Coerce value to the expected type or raise ValueError."""
+    if key == "history_retention":
+        try:
+            return parse_history_retention(value)
+        except ValueError as exc:
+            raise ValueError(f"[TraceML] {path}: {exc}") from None
+
+    if expected_type is bool:
+        if isinstance(value, bool):
+            return value
+        # Allow 0/1 as bool.
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        raise ValueError(
+            f"[TraceML] {path}: '{key}' must be a boolean (true/false), "
+            f"got {value!r}"
+        )
+
+    if expected_type is int:
+        # bool is a subclass of int; reject it explicitly.
+        if isinstance(value, bool):
+            raise ValueError(
+                f"[TraceML] {path}: '{key}' must be an integer, got {value!r}"
+            )
+        if isinstance(value, int):
+            return value
+        raise ValueError(
+            f"[TraceML] {path}: '{key}' must be an integer, got {value!r}"
+        )
+
+    if expected_type is float:
+        if isinstance(value, bool):
+            raise ValueError(
+                f"[TraceML] {path}: '{key}' must be a number, got {value!r}"
+            )
+        if isinstance(value, (int, float)):
+            number = float(value)
+            if key in _POSITIVE_FLOAT_KEYS and not is_finite_positive(number):
+                raise ValueError(
+                    f"[TraceML] {path}: '{key}' must be a finite number "
+                    f"greater than 0, got {value!r}"
+                )
+            return number
+        raise ValueError(
+            f"[TraceML] {path}: '{key}' must be a number, got {value!r}"
+        )
+
+    if expected_type is str:
+        if isinstance(value, str):
+            return value
+        raise ValueError(
+            f"[TraceML] {path}: '{key}' must be a string, got {value!r}"
+        )
+
+    return value
+
+
+def _coerce_env(key: str, raw_env: str) -> Any:
+    """Convert a TRACEML_* env var string to the correct Python type."""
+    env_var, expected_type = YAML_KEY_SCHEMA[key]
+    if key == "history_retention":
+        try:
+            return parse_history_retention(raw_env)
+        except ValueError as exc:
+            raise ValueError(
+                f"[TraceML] env var {env_var}={raw_env!r}: {exc}"
+            ) from None
+    if expected_type is bool:
+        return raw_env.strip().lower() in _BOOL_ENV_TRUE
+    if expected_type is int:
+        try:
+            return int(raw_env)
+        except ValueError:
+            raise ValueError(
+                f"[TraceML] env var {env_var}={raw_env!r} is not a valid integer."
+            ) from None
+    if expected_type is float:
+        try:
+            number = float(raw_env)
+        except ValueError:
+            raise ValueError(
+                f"[TraceML] env var {env_var}={raw_env!r} is not a valid number."
+            ) from None
+        if key in _POSITIVE_FLOAT_KEYS and not is_finite_positive(number):
+            raise ValueError(
+                f"[TraceML] env var {env_var}={raw_env!r} must be a finite "
+                "number greater than 0."
+            )
+        return number
+    return raw_env  # str
+
+
+def resolve_config(
+    cli_overrides: dict[str, Any],
+    parent_env: Mapping[str, str],
+    yaml_config: dict[str, Any],
+    defaults: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a fully resolved config using CLI > env > yaml > default precedence.
+
+    cli_overrides values of None mean "not set by the user"; any other value wins.
+    """
+    result: dict[str, Any] = {}
+    for key, (env_var, _) in YAML_KEY_SCHEMA.items():
+        cli_val = cli_overrides.get(key)
+        if cli_val is not None:
+            result[key] = cli_val
+        elif env_var in parent_env:
+            result[key] = _coerce_env(key, parent_env[env_var])
+        elif key in yaml_config:
+            result[key] = yaml_config[key]
+        else:
+            result[key] = defaults[key]
+    return result
