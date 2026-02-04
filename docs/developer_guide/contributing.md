@@ -1,0 +1,111 @@
+# Contributing
+
+## Dev setup
+
+Follow the canonical
+[development setup](https://github.com/traceopt-ai/traceml/blob/main/CONTRIBUTING.md#development-setup)
+first. Documentation builds additionally require the `lightning`, `hf`, and
+`docs` extras:
+
+```bash
+pip install -e ".[lightning,hf,docs]"
+```
+
+## Branch naming
+
+- `feature/<short-name>` — new feature work.
+- `fix/<short-name>` — bug fixes.
+- `docs/<short-name>` — docs-only changes.
+
+## Commit messages
+
+Short single-line. Imperative mood. No `Co-Authored-By` trailers.
+
+Examples:
+
+- `feat: add step-time outlier detection`
+- `fix: handle torchrun restart in rank detector`
+- `docs: clarify W&B integration example`
+
+## Code style
+
+- `black` (line length 79), `ruff`, `isort` (black profile) — enforced by pre-commit.
+- Python 3.10+ features allowed; nothing Python 3.12-only.
+
+## Docstrings
+
+NumPy style. Every public class, function, method gets one.
+
+```python
+def trace_step(model: nn.Module):
+    """Mark a training step boundary.
+
+    Responsibilities
+    ----------------
+    - Marks the semantic start/end of a training step.
+    - Attributes step-scoped timing events.
+    - Advances the global step counter.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The model being trained. Used for memory-tracker attachment.
+
+    Yields
+    ------
+    None
+        Context-manager protocol; no value yielded.
+
+    Raises
+    ------
+    RuntimeError
+        If called outside of a training loop context.
+    """
+```
+
+## Tests
+
+```bash
+pytest tests/
+```
+
+New code must include tests unless the change is docs-only.
+
+Step Time contributors should run the feature-local contract suite in
+`tests/step_time/` and read the
+[Step Time pipeline contract](step-time-pipeline-contract.md) before changing
+window, diagnosis, dashboard, or final-summary behavior.
+
+Hugging Face runtime changes should also run the real CPU product-path gate:
+
+```bash
+pytest tests/integrations/test_hf_real_runtime.py -q
+```
+
+That test covers the Trainer, sampler, TCP transport, aggregator, SQLite, and
+the public summary request/response protocol. CUDA H2D remains a manual release
+check because CI does not require a GPU:
+
+```bash
+python src/dev/repro/hf_accelerate_h2d_window.py
+```
+
+## Docs
+
+If a code change affects user-facing behavior, update the relevant doc in the same PR.
+
+- **Preview locally:** `mkdocs serve`, then open http://127.0.0.1:8000
+- **Before pushing:** `mkdocs build --strict` must succeed. The pre-push hook enforces this.
+
+## Cross-referencing
+
+Use `autorefs` to link to API symbols in prose:
+
+```markdown
+Use `import traceml_ai as traceml` and link to the public API guide for user-facing
+instrumentation examples.
+```
+
+## PR checklist
+
+A populated template appears when you open a PR. Fill every box.
