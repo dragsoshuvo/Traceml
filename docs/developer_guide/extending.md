@@ -1,0 +1,280 @@
+# Extending TraceML
+
+This guide is for contributors adding a new metric, diagnosis, summary section,
+or compare field. It follows the current code layout and avoids older internal
+paths.
+
+## Mental Model
+
+```text
+training process
+  -> samplers collect telemetry
+  -> runtime sender publishes batches
+  -> aggregator stores SQLite history
+  -> live display reads renderer/computer payloads
+  -> final report builds reporting sections
+  -> compare reads final summary JSON
+```
+
+Live UI and final summaries are separate paths. They can share diagnostics, but
+they should pass explicit policies such as `LIVE_STEP_TIME_POLICY` or
+`SUMMARY_STEP_TIME_POLICY` when thresholds differ.
+
+For Step Time specifically, start with the
+[Step Time pipeline contract](step-time-pipeline-contract.md). Its ownership
+map and six SQLite scenarios show which layer owns each calculation and how to
+verify CLI, dashboard, and final-summary behavior together.
+
+Import shared Step Time contracts from `traceml_ai.step_time.model`. The
+renderer-owned schema and historical `utils.step_time_*` paths have been
+removed. There is one typed domain model and no rank-dictionary projection on
+any built-in production path.
+
+Step Time SQLite selection and JSON normalization belong in
+`traceml_ai.step_time.sqlite`. Terminal and dashboard consumers use
+`SQLiteStepTimeRepository.load_live()` for an index-bounded tail. Final
+summary uses `load_summary()` for the same timing facts plus identities and
+run progress. Both accept `StepTimeLoadRequest`, return the same snapshot
+type, and feed the same analysis. Do not add rank-by-rank reads in renderers
+or reporting sections.
+
+Live Step Time orchestration belongs to `LiveStepTimeSession` in
+`traceml_ai.step_time.pipeline`. The session owns cursor reuse, last-good
+bridging, and monotonic expiry; a presenter receives `LiveStepTimeResult` and
+formats it. Do not open SQLite, call the analyzer, diagnose, or keep freshness
+state in a Rich or NiceGUI presenter. The CLI renderer's public `render()`
+method is the smallest example of this boundary and can be tested without a
+database.
+
+The NiceGUI driver also owns exactly one live session. Each dashboard tick
+refreshes it once and passes the same analyzed result to the Step Time hero
+and model-diagnostics composer. Add a new Step Time dashboard view by
+consuming that result; do not register another provider or add a presenter
+cache.
+
+Final-summary Step Time uses the same `StepTimePipeline` with the `summary`
+profile. `StepTimeSummarySection` runs it once and gives the completed
+`StepTimeAnalysis` to a pure reporting projector. The projector may map facts
+to stable JSON names, topology, and text, but it must not query SQLite,
+reanalyze ranks, or run diagnosis again.
+
+The three core Step Time shapes are:
+
+```text
+StepTimeRepositorySnapshot
+  -> StepTimeWindow
+  -> StepTimeAnalysis
+```
+
+For a full domain change, read `step_time/model.py`, `sqlite.py`,
+`analysis.py`, and `pipeline.py` in that order. Then open only the affected
+presenter: the Rich renderer, the relevant NiceGUI section, or the final
+summary section and projector.
+
+### Step Time extension boundary
+
+Step Time is an internal subsystem with one supported domain input:
+`StepTimeWindow`. Diagnosis calls
+`diagnose_step_time_window(window, policy=...)`; reporting reads
+`StepTimeRankFacts` and `StepTimeValues` from the same analyzed window. Do not
+add rank-map converters, surface-specific domain models, or alternate
+diagnosis builders. Stable user-facing compatibility belongs at the CLI and
+serialized-report boundaries, not between internal pipeline layers.
+
+## TraceML Lifecycle
+
+TraceML has two runtime pieces:
+
+- one aggregator, which receives TCP telemetry, writes SQLite history, and
+  creates the final summary
+- one runtime per training process, which samples local telemetry and sends
+  batches to the aggregator
+
+CLI launchers may run these pieces as subprocesses. Framework integrations may
+run them inside Ray actors or worker processes. Both paths should use
+`traceml_ai.runtime.lifecycle` so startup and shutdown stay consistent.
+
+The owner that starts a component must stop it. Use `try/finally` around
+training work, and make stop paths safe to call more than once.
+
+## Ray Integration
+
+Ray support lives in `traceml_ai.integrations.ray` and should stay separate from
+the core runtime. Do not import Ray from `traceml_ai.runtime`, `traceml_ai.aggregator`,
+or the public `traceml_ai` package surface.
+
+The integration has two owners:
+
+- the Ray aggregator actor owns `start_aggregator(...)` and `handle.stop(...)`
+- the Ray worker wrapper owns `start_runtime(...)` and `handle.stop(...)`
+
+Ray owns scheduling, process groups, ranks, and DDP/NCCL/Gloo communication.
+TraceML only starts telemetry components inside the processes Ray already
+created. Keep future Ray changes in that shape: no second launcher, no Ray Train
+internals, and no duplicated aggregator/runtime lifecycle code.
+
+
+## Add a Diagnostic Rule
+
+Diagnostics live under `src/traceml_ai/diagnostics/<domain>/`.
+
+Current domains include:
+
+- `system`
+- `process`
+- `step_time`
+- `step_memory`
+
+Typical files:
+
+```text
+context.py   normalized input signals
+policy.py    thresholds and named policies
+rules.py     one rule class per issue
+api.py       public builder that runs rules and selects primary diagnosis
+```
+
+Add one rule class in `rules.py`, add it to the domain's default rule tuple,
+then update priority sorting if the new issue should beat existing issues.
+
+Tests should live in `tests/diagnostics/` and cover:
+
+- the rule triggers
+- the rule does not trigger for normal input
+- priority when multiple issues trigger together
+
+## Add a Summary Section
+
+Final-report sections live under `src/traceml_ai/reporting/sections/`.
+
+Current sections:
+
+- `system`
+- `process`
+- `step_time`
+- `step_memory`
+
+Most sections use some variation of this shape:
+
+```text
+loader.py     read SQLite / section inputs
+builder.py    build JSON payload and card text
+formatter.py  render section text
+model.py      section-local data helpers
+```
+
+Do not add empty layers merely to match that filename list. Step Time already
+loads, analyzes, and diagnoses through `StepTimePipeline`, so its reporting
+section contains only orchestration and a pure projector. It has no parallel
+loader model and no second statistics implementation.
+
+Register sections through `src/traceml_ai/reporting/final.py`. Keep the aggregator
+as a caller only; report assembly belongs in `reporting`.
+
+Tests should live in `tests/reporting/summary/`. Prefer small SQLite fixtures
+over large golden snapshots. Assert stable schema keys and a few important text
+lines.
+
+## Add a Sampler
+
+Runtime sampler selection is in `src/traceml_ai/runtime/sampler_registry.py`.
+
+To add a sampler:
+
+1. Implement a `BaseSampler` subclass under `src/traceml_ai/samplers/`.
+2. Add a `SamplerSpec` to `DEFAULT_SAMPLER_REGISTRY`.
+3. Restrict it by `profiles` and `modes` so it only runs where needed.
+4. Add SQLite projection, renderer, or summary code only if the data is
+   user-facing.
+
+TraceML no longer ships layer-level/deep profiling. Keep normal sampler changes
+scoped to `run` and `watch`, and do not document layer-level profiling as a
+public path unless that surface is reintroduced deliberately.
+
+Tests should live in `tests/runtime/` for selection behavior and in a more
+specific folder if the sampler has domain logic.
+
+## Add a Compare Metric
+
+Compare code lives under `src/traceml_ai/reporting/compare/`.
+
+Important files:
+
+```text
+sections/<section>.py  extract comparable values from final summary JSON
+model.py              typed compare objects
+verdict.py            rule-based verdict selection
+formatters.py         terminal text output
+core.py               payload assembly
+```
+
+Add metric extraction to the relevant section comparer first. Only add a verdict
+rule if the metric should affect the top-level outcome. Only show a row in the
+text formatter if it helps users compare runs quickly.
+
+Tests should live in `tests/reporting/compare/` and cover missing data, changed
+values, and verdict priority when multiple signals disagree.
+
+## Add Live Display
+
+Live display code is renderer-driven. CLI and dashboard renderers may differ.
+
+Relevant paths:
+
+- `src/traceml_ai/renderers/`
+- `src/traceml_ai/aggregator/display_drivers/`
+
+Keep renderer methods focused on presentation. Put data shaping in a compute
+object or formatter when the logic is reusable or non-trivial.
+
+## Fail Open
+
+TraceML should not break user training because optional telemetry, rendering,
+or reporting failed. Existing code logs advisory failures through
+`traceml_ai.loggers.error_log.get_error_logger`.
+
+Process entrypoints configure that logger once with the `rank`, `aggregator`,
+or `launcher` role. Components should request a named child logger rather than
+adding handlers or choosing paths themselves. Internal logs accept ERROR-level
+TraceML implementation failures only; do not send user exceptions or workload
+stderr to them. Use `log_internal_exception` when recording a caught exception;
+it preserves explicit TraceML causes without copying implicit context from a
+user exception that is already unwinding.
+
+Use that pattern for non-critical paths:
+
+```python
+from traceml_ai.loggers.error_log import (
+    get_error_logger,
+    log_internal_exception,
+)
+
+logger = get_error_logger("MyComponent")
+try:
+    ...
+except Exception as exc:
+    log_internal_exception(logger, "[TraceML] MyComponent failed", exc)
+```
+
+Prefer returning an empty payload, `NO DATA` diagnosis, or fallback text over
+raising from live display, compare rendering, or final-report generation.
+
+## Test Layout
+
+Tests are grouped by area:
+
+```text
+tests/core/
+tests/diagnostics/
+tests/reporting/summary/
+tests/reporting/compare/
+tests/runtime/
+tests/sdk/
+tests/telemetry/
+tests/display/
+tests/integrations/
+tests/step_time/       cross-surface Step Time contracts
+```
+
+Keep tests close to the behavior they protect. The most valuable tests are
+small and direct: rule behavior, priority, schema shape, and fail-open behavior.
