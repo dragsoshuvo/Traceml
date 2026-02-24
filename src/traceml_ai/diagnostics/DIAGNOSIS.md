@@ -1,0 +1,288 @@
+# Final Summary Diagnoses
+
+TraceML emits a sorted list of `DiagnosticIssue` findings or states per final
+summary section. `issues[0]` is the primary diagnosis, and final-summary JSON
+also copies that same item to `diagnosis`.
+
+The final summary also includes a top-level `primary_diagnosis`. That field is
+a run-level performance finding promoted from existing section diagnoses. It is
+not a replacement for section diagnoses and it is not a health-warning rollup.
+Since schema `1.8`, Step Time drives the top-level primary diagnosis; System GPU
+utilization can appear as supporting evidence or as an unexplained-utilization
+fallback. System, Process, and Step Memory resource findings remain canonical
+inside their sections.
+
+Three `primary_diagnosis` kinds are top-level only. No section emits them:
+
+- `INSUFFICIENT_STEP_TIME_DATA`: the Step Time diagnosis is `NO_DATA`,
+  `WARMUP`, or `INCOMPLETE_DATA`, so no performance cause is available.
+- `LOW_GPU_UTILIZATION_UNEXPLAINED`: Step Time is `BALANCED` and System
+  reports `LOW_GPU_UTILIZATION` or `MODERATE_GPU_UTILIZATION`.
+- `NO_CLEAR_PERFORMANCE_BOTTLENECK`: Step Time is `BALANCED` and GPU
+  utilization is not low or moderate. It is also the fallback for a Step
+  Time kind the policy does not recognize.
+
+For the full field shape and the selection policy, see
+[Primary Diagnosis Shape](../reporting/SCHEMA.md#primary-diagnosis-shape).
+
+Use `kind` as the stable internal key for logic and comparisons. Use `status`
+as the user-facing display label. In many cases they are similar, but they are
+not required to match; System statuses intentionally use compact labels such as
+`HIGH GPU MEM` and `MODERATE GPU UTIL`.
+
+Diagnoses are conservative. They identify likely bottleneck categories, not a
+complete root-cause proof.
+
+## System
+
+Host/node pressure and GPU-utilization symptoms.
+
+- `NO_DATA`: no system telemetry.
+- `NORMAL`: no CPU, RAM, or available GPU pressure.
+- `VERY_HIGH_GPU_MEMORY`: critical GPU memory pressure.
+- `HIGH_GPU_MEMORY`: elevated GPU memory pressure.
+- `HIGH_GPU_TEMPERATURE`: elevated GPU temperature.
+- `HIGH_GPU_POWER`: elevated GPU power use.
+- `HIGH_HOST_MEMORY`: elevated host RAM use.
+- `HIGH_CPU`: elevated host CPU use.
+- `LOW_GPU_UTILIZATION`: average GPU utilization is below 30%. The GPU was
+  mostly idle.
+- `MODERATE_GPU_UTILIZATION`: average GPU utilization is between 30% and 70%,
+  inclusive. The GPU was only partly utilized.
+
+`LOW_GPU_UTILIZATION` and `MODERATE_GPU_UTILIZATION` are observed System
+symptoms, not root-cause proof. Use Step Time to identify whether the likely
+cause is input loading, compute balance, residuals, synchronization, or other
+training behavior. Average GPU utilization above 70% does not emit a
+GPU-utilization issue and can remain `NORMAL` when no pressure rules fire.
+
+## Process
+
+Traced process pressure.
+
+- `NO_DATA`: no process telemetry.
+- `NORMAL`: no process CPU, RSS, or available GPU memory pressure.
+- `VERY_HIGH_PROCESS_GPU_MEMORY`: critical process GPU memory pressure.
+- `HIGH_PROCESS_GPU_MEMORY`: elevated process GPU memory pressure.
+- `GPU_MEMORY_RESERVED_OVERHANG` with status
+  `HIGH CUDA ALLOCATOR RESERVED/ALLOCATED RATIO`: PyTorch CUDA allocator
+  reserved memory is much higher than allocated tensor memory.
+- `RANK_GPU_MEMORY_IMBALANCE`: GPU memory differs materially across ranks.
+- `HIGH_PROCESS_RSS`: elevated process RSS.
+- `HIGH_PROCESS_CPU`: elevated process CPU relative to CPU capacity.
+
+## Step Time
+
+Training-step timing.
+
+- `NO_DATA`: no usable step-time data.
+- `WARMUP`: some data exists, but not enough for diagnosis.
+- `INCOMPLETE_DATA` with status `INCOMPLETE DATA`: timing exists, but one or
+  more phase signals were not measured on every observed rank and no rule
+  could reach a reliable conclusion. The evidence lists `missing_signals`
+  (metric names) and per-signal `signal_coverage` (`measured ranks /
+  observed ranks`).
+- `BALANCED`: no clear timing bottleneck or rank straggler.
+- `STRAGGLER`: visible rank skew exists, but input wait, H2D, and DDP forward
+  do not explain the likely culprit.
+- `INPUT_STRAGGLER`: the culprit rank has materially higher selected-clock
+  input wait than the victim rank.
+- `COMPUTE_STRAGGLER`: in DDP/default strategy, the culprit rank has
+  materially higher forward time than the victim rank.
+- `H2D_STRAGGLER`: the culprit rank has materially higher host-to-device
+  transfer time than the victim rank.
+- `INPUT_BOUND`: selected-clock input wait is a material typical Step Time cost.
+- `H2D_BOUND`: selected-clock GPU H2D transfer is a material typical Step Time
+  cost.
+- `COMPUTE_BOUND`: forward/backward/optimizer time dominates the typical Step
+  Time;
+  this is informational when no material overhead is visible.
+- `RESIDUAL_HEAVY`: unattributed residual time is a material typical Step Time
+  cost.
+
+Missing signals and measured zeros are different things. A timing event that
+was never observed in the window stays an absent metric (it is not converted
+to `0.0`), while a phase measured at `0.0` stays a valid zero. Availability
+is metric-specific. Occurrence-driven metrics (`optimizer_step`, `h2d`)
+legitimately skip steps: the optimizer under gradient accumulation, and H2D
+when a step performs no host-to-device copies. They are available for a rank
+when measured in at least one aligned step, and their absent steps count as
+zero work. Every other metric (`input_wait`, `forward`, `backward`,
+`traced_step_time`) must occur on every bracketed step, so it is available only
+when measured in every aligned step of the rank's window; intermittent
+presence means the instrumentation dropped out mid-window and drops
+availability instead of synthesizing zeros that would leak the missing work
+into the residual. An absent H2D means "no observed transfers", contributes
+zero to derived metrics, and is never reported as a missing signal. Derived
+metrics exist only when their inputs are available: `compute` needs forward,
+backward, and optimizer; outer `step_time` needs Input Wait plus Traced Step
+Time; `residual_proxy` needs Traced Step Time plus every compute phase.
+
+The canonical `StepTimeWindow` carries the expected rank universe and sparse
+per-rank metrics. A metric's measured-rank population and any multi-metric
+eligible cohort are derived directly from those facts. Diagnosis, reporting,
+and presentation layers must not reconstruct a separate availability policy
+from aggregate values.
+
+The public final-summary projection preserves absence rather than
+re-deriving declined values. Each rule abstains when
+its required signals are unavailable: input needs input wait + outer Step
+Time; H2D needs GPU-clock H2D + outer Step Time; compute and residual need
+every compute phase + outer Step Time; rank stragglers need their visible-phase
+anchors + outer Step Time. Rules still fire from the
+ranks that measured their signals, so one dark rank does not silence an
+otherwise measured finding. When no rule fires and at least one abstained
+for missing signals, Step Time reports `INCOMPLETE_DATA` instead of
+`BALANCED`.
+
+Step-time diagnosis uses one selected clock for the analyzed window. It uses
+GPU event timing when every rank/step has GPU timing for Traced Step Time,
+Input Wait, and traced phase events present in the window. Otherwise it uses
+explicit `cpu_ms` timing. The live CLI Step Time table, dashboard, and final
+summary use the same global-rank SQLite loader and selected-clock window
+builder for diagnosis-facing timing; they differ only by row window sizing.
+The canonical model exposes selected-clock `input_wait_ms`, outer
+`step_time_ms`, and inner `traced_step_time_ms`. Summary JSON also publishes
+explicit CPU and GPU Step Time and Traced Step Time aggregates.
+`dataloader_fetch_cpu_ms` remains supplemental CPU fetch evidence and is not a
+selected-clock phase-share denominator or a second Step Time component.
+`duration_ms` stays stored compatibility timing and is not used for Step Time
+display or diagnosis. In the final text report, selected-clock phase shares
+are divided directly by public `step_time_ms`. These report-table shares are
+observational and do not replace the median per-rank diagnosis score.
+
+Typical overhead diagnoses use selected-clock per-rank Step Time shares:
+
+```text
+step_time_r = input_wait_r + traced_step_time_r
+component_share_r = component_r / step_time_r
+typical_component_share = median(component_share_r across ranks)
+```
+
+`INPUT_BOUND` uses `input_wait`, `H2D_BOUND` uses H2D transfer, and
+`RESIDUAL_HEAVY` uses residual as the component. They warn at 10% and are
+critical at 20%. `H2D_BOUND` requires GPU-selected timing, so asynchronous CPU
+host-call duration is not reported as transfer cost. Cross-rank skew remains
+evidence in a typical-bottleneck finding, but does not suppress one. In
+contrast, `H2D_STRAGGLER` identifies one rank's excess H2D time.
+`COMPUTE_BOUND` remains an informational finding when the median per-rank
+compute share reaches 90% of selected-clock Step Time and no material
+input, H2D, or residual overhead is visible. Built-in live and summary policies
+use this same threshold; their analyzed window sizes differ.
+
+Step Time uses `DiagnosticIssue.score` as normalized Step Time impact for
+`INPUT_BOUND`, `H2D_BOUND`, `RESIDUAL_HEAVY`, and all rank-straggler findings.
+Typical findings use the median per-rank share above; stragglers use the
+culprit/victim score below. `COMPUTE_BOUND` has no score because its
+informational context is excluded from impact-based primary ordering.
+
+When several Step Time findings qualify, TraceML orders them by severity, then
+score. A rank straggler wins only an exact severity-and-score tie with a
+typical finding; ties within the same scope preserve rule order. The primary
+diagnosis is always the first ordered issue.
+
+The Step Time summary card reuses the selected issue summary for its reason
+text. It does not recompute phase shares or rank-straggler attribution from
+display rollups.
+
+Shared Step Time diagnosis needs at least 2 steps to emit warning-only
+bottleneck diagnoses. Critical diagnoses are allowed once the window has at
+least 20 steps. Live and summary use the same diagnosis gates; they differ by
+the selected timing window size.
+
+When runtime environment metadata is available, Step Time diagnosis also
+receives an advisory training strategy such as `ddp` or `fsdp`. This context is
+used only to choose diagnosis attribution behavior; it is not a public Step
+Time metric. Missing or unrecognized strategy metadata defaults to `ddp` to
+preserve the DDP/default visible-backward straggler behavior. DDP remains
+eligible for critical Step Time diagnoses once thresholds and confidence gates
+are met. FSDP Step Time diagnoses are capped at warning because collective
+masking can make attribution under-confident.
+
+`RESIDUAL_HEAVY` is not a communication diagnosis. `residual_ms` is residual
+unattributed step time averaged from per-step clamped residuals:
+
+```text
+compute_ms = forward_ms + backward_ms + optimizer_ms
+known_step_ms = h2d_ms + compute_ms
+traced_step_time_ms = selected Traced Step Time
+step_time_ms = selected input_wait_ms + selected traced_step_time_ms
+residual_ms = average(max(0, traced_step_time_ms - known_step_ms))
+```
+
+Rank stragglers use culprit/victim evidence from selected-clock timing. TraceML
+first chooses one visible synchronization phase:
+
+```text
+visible_r = backward_r              # DDP/default
+visible_r = forward_r + backward_r  # FSDP
+```
+
+Only ranks with measured visible-phase anchors and measured outer Step Time
+are eligible:
+
+```text
+DDP/default: input_wait measured and backward_r > 0 and step_time_r > 0
+FSDP:        input_wait measured and forward_r > 0 and backward_r > 0
+             and step_time_r > 0
+```
+
+If fewer than two ranks are eligible, TraceML does not report a rank straggler.
+Missing visible instrumentation causes this rule to abstain instead of treating
+zero as a fast rank. `input_wait == 0` and `h2d == 0` remain valid component
+values.
+
+The culprit rank is the rank with the minimum visible value. This is the rank
+that likely arrived late and therefore waited least in the visible phase. The
+victim rank is the upper actual median rank by visible value.
+
+```text
+score = (visible_victim - visible_culprit) / step_time_victim
+```
+
+If `score < 0.10`, TraceML does not report a rank straggler. At 10% it reports
+a warning; at 20% it reports critical severity when the existing confidence
+gates permit it. Otherwise it compares the culprit directly with the victim:
+
+```text
+input_excess = input_wait_culprit - input_wait_victim
+h2d_excess = h2d_culprit - h2d_victim
+forward_excess = forward_culprit - forward_victim  # DDP/default only
+```
+
+Every candidate component must be measured on both the culprit and victim
+ranks: DDP/default compute attribution requires measured forward time on
+both, and H2D attribution requires measured H2D time on both, so an
+unmeasured phase can never name the cause. A component names the cause only
+when it covers at least 80% of visible wait cost:
+
+```text
+component_coverage = min(1, component_excess / visible_cost)
+```
+
+The highest qualifying coverage becomes `INPUT_STRAGGLER`, `H2D_STRAGGLER`,
+or, for DDP/default only, `COMPUTE_STRAGGLER`. Otherwise the diagnosis stays
+`STRAGGLER` with a sync-or-unattributed component and coverage evidence.
+Coverage chooses the label; the score alone chooses severity.
+
+It can include validation, checkpointing, logging, framework orchestration, CPU
+stalls, unobserved transfer stalls, or other work inside the timed step but
+outside the traced H2D and compute phases. It is not direct NCCL, all-reduce,
+or synchronization timing.
+
+## Step Memory
+
+Per-step peak allocated/reserved memory.
+
+- `NO_DATA`: no usable step-memory data.
+- `NO_GPU` with status `NO GPU`: no GPU telemetry or CPU-only run.
+- `BALANCED`: no clear memory pressure, imbalance, or rising trend.
+- `HIGH_PRESSURE`: peak memory is near device capacity.
+- `IMBALANCE`: peak memory differs materially across ranks.
+- `CREEP_EARLY` with status `MEMORY RISING`: memory is rising, but below the
+  confirmed-growth threshold.
+- `CREEP_CONFIRMED` with status `MEMORY CREEP`: memory is rising and crossed
+  the confirmed-growth threshold.
+
+`HIGH_PRESSURE` requires known GPU capacity. If capacity is unavailable,
+TraceML does not guess pressure.
