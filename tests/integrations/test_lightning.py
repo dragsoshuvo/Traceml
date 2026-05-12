@@ -1,0 +1,867 @@
+from contextlib import contextmanager
+from queue import Queue
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch.nn as nn
+
+from traceml_ai.instrumentation import step_events
+from traceml_ai.instrumentation.step_events import (
+    StepCapture,
+    TimeEvent,
+    TimeScope,
+)
+from traceml_ai.integrations import lightning as lightning_integration
+
+
+def _enable_callback_without_lightning(monkeypatch):
+    monkeypatch.setattr(
+        lightning_integration,
+        "IS_LIGHTNING_AVAILABLE",
+        True,
+    )
+
+
+@pytest.mark.parametrize("error", [ValueError, BrokenPipeError])
+@pytest.mark.parametrize("logger_fails", [False, True])
+def test_lightning_error_reporting_never_raises(
+    monkeypatch, error, logger_fails
+):
+    from traceml_ai.loggers import error_log
+
+    logger = Mock()
+    if logger_fails:
+        logger.exception.side_effect = OSError("log unavailable")
+    monkeypatch.setattr(error_log, "get_error_logger", lambda name: logger)
+    stream = Mock()
+    stream.write.side_effect = error("stderr unavailable")
+    with monkeypatch.context() as patch:
+        patch.setattr(lightning_integration.sys, "stderr", stream)
+        lightning_integration._log_lightning_error(
+            "test diagnostic", RuntimeError("adapter failure")
+        )
+    logger.exception.assert_called_once_with("[TraceML] %s", "test diagnostic")
+    assert stream.write.called
+
+
+@pytest.mark.parametrize("stage", ["validate", "test", "predict", None])
+def test_non_fit_setup_preserves_pending_capture(monkeypatch, stage):
+    _enable_callback_without_lightning(monkeypatch)
+    capture = step_events.begin_step_capture()
+    event = TimeEvent("other work", "cpu", 1.0, 2.0)
+    capture.record_timing(event)
+    callback = lightning_integration.TraceMLCallback()
+    try:
+        callback.setup(
+            SimpleNamespace(training=False, strategy=None),
+            nn.Linear(2, 2),
+            stage=stage,
+        )
+        assert step_events.begin_step_capture() is capture
+        assert event in capture.timing_events
+    finally:
+        callback._exit_dataloader_timing_scope()
+        step_events.abort_step_capture(capture)
+
+
+def test_lightning_callback_base_combines_distinct_namespaces() -> None:
+    class NewNamespaceCallback:
+        pass
+
+    class LegacyNamespaceCallback:
+        pass
+
+    resolved = lightning_integration._build_callback_base(
+        (NewNamespaceCallback, LegacyNamespaceCallback)
+    )
+
+    assert resolved.available is True
+    assert issubclass(resolved.base, NewNamespaceCallback)
+    assert issubclass(resolved.base, LegacyNamespaceCallback)
+
+
+def test_lightning_callback_base_dedupes_matching_namespaces() -> None:
+    class SharedCallback:
+        pass
+
+    resolved = lightning_integration._build_callback_base(
+        (SharedCallback, SharedCallback)
+    )
+
+    assert resolved.available is True
+    assert resolved.base is SharedCallback
+
+
+def test_lightning_forward_wrapper_times_only_forward(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+    calls = []
+
+    @contextmanager
+    def fake_timed_region(name, scope, record_gpu_events=True):
+        calls.append((name, scope, record_gpu_events))
+        yield
+
+    monkeypatch.setattr(
+        lightning_integration,
+        "timed_region",
+        fake_timed_region,
+    )
+
+    class FakeModule(nn.Module):
+        def training_step(self, value):
+            return self(value)
+
+        def forward(self, value):
+            return value + 1
+
+    trainer = SimpleNamespace(training=True, strategy=None)
+    module = FakeModule()
+    callback = lightning_integration.TraceMLCallback()
+
+    assert "training_step" not in module.__dict__
+    assert not module._forward_hooks
+    assert not module._forward_pre_hooks
+
+    callback.setup(trainer, module, stage="fit")
+    assert "training_step" not in module.__dict__
+    assert not module._forward_hooks
+    assert not module._forward_pre_hooks
+    callback.on_train_start(trainer, module)
+    assert "training_step" in module.__dict__
+
+    # Even a training-stage forward outside a batch must not become a step.
+    assert module(0) == 1
+    assert calls == []
+    callback._step_capture = step_events.begin_step_capture()
+    assert module.training_step(1) == 2
+    # Recomputed module calls during backward are not forward measurements.
+    callback._backward_ctx = object()
+    assert module.training_step(1) == 2
+    callback._backward_ctx = None
+    trainer.training = False
+    assert module.training_step(2) == 3
+
+    assert calls == [("_traceml_internal:forward_time", TimeScope.STEP, True)]
+
+    callback.teardown(trainer, module)
+    assert "training_step" not in module.__dict__
+    assert not module._forward_hooks
+    assert not module._forward_pre_hooks
+
+    assert module(3) == 4
+    assert calls == [("_traceml_internal:forward_time", TimeScope.STEP, True)]
+
+
+def test_lightning_forward_hooks_stop_at_direct_children(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+
+    class Branch(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.leaf = nn.Linear(2, 2)
+
+        def forward(self, value):
+            return self.leaf(value)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.branch = Branch()
+
+        def training_step(self, value):
+            return self.branch(value)
+
+    trainer = SimpleNamespace(training=True, strategy=None)
+    module = Model()
+    callback = lightning_integration.TraceMLCallback()
+    callback.on_train_start(trainer, module)
+
+    assert module._forward_hooks and module._forward_pre_hooks
+    assert module.branch._forward_hooks and module.branch._forward_pre_hooks
+    assert not module.branch.leaf._forward_hooks
+    assert not module.branch.leaf._forward_pre_hooks
+
+    callback.teardown(trainer, module)
+
+
+def test_lightning_disabled_after_import_does_not_wrap_or_record(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+    monkeypatch.setenv("TRACEML_DISABLED", "1")
+    calls = []
+
+    @contextmanager
+    def fake_timed_region(name, scope, record_gpu_events=True):
+        calls.append((name, scope, record_gpu_events))
+        yield
+
+    class FakeStrategy:
+        root_device = "cuda:0"
+
+        def batch_to_device(self, batch, *args, **kwargs):
+            return batch
+
+    class FakeModule(nn.Module):
+        device = "cuda:0"
+
+        def forward(self, value):
+            return value + 1
+
+    monkeypatch.setattr(
+        lightning_integration,
+        "timed_region",
+        fake_timed_region,
+    )
+    monkeypatch.setattr(
+        lightning_integration,
+        "StepMemoryTracker",
+        lambda module: (_ for _ in ()).throw(
+            AssertionError("disabled callback must not create memory tracker")
+        ),
+    )
+
+    strategy = FakeStrategy()
+    original_batch_to_device = strategy.batch_to_device
+    trainer = SimpleNamespace(training=True, strategy=strategy)
+    module = FakeModule()
+    callback = lightning_integration.TraceMLCallback()
+
+    callback.setup(trainer, module, stage="fit")
+    assert "training_step" not in module.__dict__
+    assert not module._forward_hooks
+    assert not module._forward_pre_hooks
+    assert (
+        strategy.batch_to_device.__func__ is original_batch_to_device.__func__
+    )
+
+    callback.on_train_batch_start(trainer, module, batch=None, batch_idx=0)
+    callback.on_before_backward(trainer, module, loss=None)
+    callback.on_after_backward(trainer, module)
+    callback.on_before_optimizer_step(trainer, module, optimizer=None)
+    callback.on_train_batch_end(
+        trainer,
+        module,
+        outputs=None,
+        batch=None,
+        batch_idx=0,
+    )
+
+    assert module(1) == 2
+    assert calls == []
+
+
+def test_lightning_batch_start_does_not_open_forward_region(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+    calls = []
+
+    @contextmanager
+    def fake_timed_region(name, scope, record_gpu_events=True):
+        calls.append((name, scope, record_gpu_events))
+        yield
+
+    class FakeMemoryTracker:
+        def __init__(self, module):
+            self.module = module
+
+        def reset(self):
+            return None
+
+    monkeypatch.setattr(
+        lightning_integration,
+        "timed_region",
+        fake_timed_region,
+    )
+    monkeypatch.setattr(
+        lightning_integration,
+        "StepMemoryTracker",
+        FakeMemoryTracker,
+    )
+
+    callback = lightning_integration.TraceMLCallback()
+
+    callback.on_train_batch_start(
+        SimpleNamespace(training=True),
+        object(),
+        batch=None,
+        batch_idx=0,
+    )
+    callback._close_context("_traceml_step_ctx")
+
+    assert calls == [("_traceml_internal:step_time", "step", True)]
+
+
+def test_lightning_teardown_discards_an_incomplete_capture(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+    monkeypatch.setattr(step_events, "_STEP_TIME_QUEUE", Queue(maxsize=2048))
+    monkeypatch.setattr(step_events, "_ACTIVE_STEP_CAPTURE", StepCapture())
+
+    @contextmanager
+    def fake_timed_region(name, scope, record_gpu_events=True):
+        yield
+
+    class FakeMemoryTracker:
+        def __init__(self, module):
+            pass
+
+        def reset(self):
+            pass
+
+    monkeypatch.setattr(
+        lightning_integration, "timed_region", fake_timed_region
+    )
+    monkeypatch.setattr(
+        lightning_integration, "StepMemoryTracker", FakeMemoryTracker
+    )
+
+    trainer = SimpleNamespace(training=True, strategy=None)
+    module = nn.Linear(1, 1)
+    callback = lightning_integration.TraceMLCallback()
+    callback.on_train_batch_start(trainer, module, batch=None, batch_idx=0)
+    capture = callback._step_capture
+    step_events.record_step_time_event(
+        TimeEvent("failed_lightning_batch", "cpu", 1.0, 2.0)
+    )
+
+    callback.teardown(trainer, module)
+
+    assert capture is not None
+    assert not step_events.complete_step_capture(capture, 1)
+    assert step_events.drain_step_time_batches() == []
+
+
+class _FakeMemoryTracker:
+    def __init__(self, module):
+        self.module = module
+
+    def reset(self):
+        return None
+
+    def record(self):
+        return None
+
+
+def _ordered_fake_timed_region(calls):
+    @contextmanager
+    def fake_timed_region(name, scope, record_gpu_events=True):
+        calls.append(f"enter:{name}")
+        try:
+            yield
+        finally:
+            calls.append(f"exit:{name}")
+
+    return fake_timed_region
+
+
+def test_lightning_batch_to_device_opens_the_step_envelope_first(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        lightning_integration,
+        "timed_region",
+        _ordered_fake_timed_region(calls),
+    )
+    monkeypatch.setattr(
+        lightning_integration, "StepMemoryTracker", _FakeMemoryTracker
+    )
+    monkeypatch.setattr(
+        lightning_integration, "complete_step_capture", lambda *a: None
+    )
+    monkeypatch.setattr(
+        lightning_integration, "mark_trace_step_flushed", lambda *a: None
+    )
+
+    class FakeStrategy:
+        root_device = "cpu"
+
+        def batch_to_device(self, batch, *args, **kwargs):
+            calls.append("transfer")
+            return batch
+
+    strategy = FakeStrategy()
+    trainer = SimpleNamespace(training=True, strategy=strategy)
+    module = nn.Linear(2, 2)
+    callback = lightning_integration.TraceMLCallback()
+    callback.setup(trainer, module, stage="fit")
+
+    strategy.batch_to_device(object())
+    callback.on_train_batch_start(trainer, module, batch=None, batch_idx=0)
+    callback.on_train_batch_end(
+        trainer, module, outputs=None, batch=None, batch_idx=0
+    )
+
+    assert calls == [
+        "enter:_traceml_internal:step_time",
+        "transfer",
+        "exit:_traceml_internal:step_time",
+    ]
+
+    # Outside training (validation, test, predict) the transfer opens nothing.
+    calls.clear()
+    trainer.training = False
+    strategy.batch_to_device(object())
+    assert calls == ["transfer"]
+    callback.teardown(trainer, module)
+
+
+def test_lightning_accumulation_keeps_one_capture_until_update(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+    monkeypatch.setattr(step_events, "_ACTIVE_STEP_CAPTURE", StepCapture())
+    monkeypatch.setattr(
+        lightning_integration, "timed_region", _ordered_fake_timed_region([])
+    )
+
+    trackers = []
+
+    class FakeMemoryTracker(_FakeMemoryTracker):
+        def __init__(self, module):
+            super().__init__(module)
+            self.resets = 0
+            self.records = 0
+            trackers.append(self)
+
+        def reset(self):
+            self.resets += 1
+
+        def record(self):
+            self.records += 1
+
+    monkeypatch.setattr(
+        lightning_integration, "StepMemoryTracker", FakeMemoryTracker
+    )
+    completed = []
+    monkeypatch.setattr(
+        lightning_integration,
+        "complete_step_capture",
+        lambda capture, step: completed.append((capture, step)),
+    )
+    flushed = []
+    monkeypatch.setattr(
+        lightning_integration,
+        "mark_trace_step_flushed",
+        flushed.append,
+    )
+    trace_state = SimpleNamespace(step=0)
+
+    def advance_step():
+        trace_state.step += 1
+
+    trace_state.advance_step = advance_step
+    monkeypatch.setattr(
+        lightning_integration,
+        "get_trace_session_state",
+        lambda: trace_state,
+    )
+
+    accumulating = True
+    trainer = SimpleNamespace(
+        training=True,
+        strategy=None,
+        fit_loop=SimpleNamespace(_should_accumulate=lambda: accumulating),
+    )
+    module = nn.Linear(2, 2)
+    module.automatic_optimization = True
+    callback = lightning_integration.TraceMLCallback()
+
+    callback.on_train_batch_start(trainer, module, batch=None, batch_idx=0)
+    capture = callback._step_capture
+    tracker = callback._mem_tracker
+    callback.on_before_backward(trainer, module, loss=None)
+    callback.on_after_backward(trainer, module)
+    callback.on_train_batch_end(
+        trainer, module, outputs=None, batch=None, batch_idx=0
+    )
+
+    assert callback._step_capture is capture
+    assert callback._mem_tracker is tracker
+    assert trace_state.step == 0
+    assert completed == []
+    assert flushed == []
+
+    accumulating = False
+    callback.on_train_batch_start(trainer, module, batch=None, batch_idx=1)
+    callback.on_before_optimizer_step(trainer, module, optimizer=None)
+    callback.on_train_batch_end(
+        trainer, module, outputs=None, batch=None, batch_idx=1
+    )
+
+    assert trackers == [tracker]
+    assert tracker.resets == 1
+    assert tracker.records == 1
+    assert trace_state.step == 1
+    assert completed == [(capture, 1)]
+    assert flushed == [1]
+    assert callback._step_capture is None
+    assert callback._mem_tracker is None
+    assert callback._memory_window_attempted is False
+
+
+def test_lightning_memory_reset_failure_is_not_retried_mid_group(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+    attempts = []
+
+    class FailingMemoryTracker:
+        def __init__(self, module):
+            attempts.append(module)
+
+        def reset(self):
+            raise RuntimeError("reset failed")
+
+    monkeypatch.setattr(
+        lightning_integration, "StepMemoryTracker", FailingMemoryTracker
+    )
+    monkeypatch.setattr(
+        lightning_integration, "_log_lightning_error", lambda *a: None
+    )
+
+    accumulating = True
+    monkeypatch.setattr(
+        lightning_integration,
+        "_lightning_is_accumulating",
+        lambda *a: accumulating,
+    )
+    trace_state = SimpleNamespace(step=0)
+
+    def advance_step():
+        trace_state.step += 1
+
+    trace_state.advance_step = advance_step
+    monkeypatch.setattr(
+        lightning_integration,
+        "get_trace_session_state",
+        lambda: trace_state,
+    )
+    monkeypatch.setattr(
+        lightning_integration, "complete_step_capture", lambda *a: None
+    )
+    monkeypatch.setattr(
+        lightning_integration, "mark_trace_step_flushed", lambda *a: None
+    )
+
+    trainer = SimpleNamespace(training=True, strategy=None)
+    module = nn.Linear(2, 2)
+    callback = lightning_integration.TraceMLCallback()
+    monkeypatch.setattr(callback, "_open_step_region", lambda: None)
+    monkeypatch.setattr(callback, "_close_all_contexts", lambda: None)
+
+    callback.on_train_batch_start(trainer, module, batch=None, batch_idx=0)
+    callback.on_train_batch_end(
+        trainer, module, outputs=None, batch=None, batch_idx=0
+    )
+    callback.on_train_batch_start(trainer, module, batch=None, batch_idx=1)
+
+    assert attempts == [module]
+    assert callback._memory_window_attempted is True
+
+    accumulating = False
+    callback.on_train_batch_end(
+        trainer, module, outputs=None, batch=None, batch_idx=1
+    )
+    assert callback._memory_window_attempted is False
+    callback.on_train_batch_start(trainer, module, batch=None, batch_idx=2)
+
+    assert attempts == [module, module]
+
+
+def test_lightning_second_optimizer_step_closes_the_previous_region(
+    monkeypatch,
+):
+    _enable_callback_without_lightning(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        lightning_integration,
+        "timed_region",
+        _ordered_fake_timed_region(calls),
+    )
+    trainer = SimpleNamespace(training=True, strategy=None)
+    module = nn.Linear(2, 2)
+    callback = lightning_integration.TraceMLCallback()
+
+    callback.on_before_optimizer_step(trainer, module, optimizer=None)
+    callback.on_before_optimizer_step(trainer, module, optimizer=None)
+    callback._close_context("_optimizer_ctx")
+
+    assert calls == [
+        "enter:_traceml_internal:optimizer_step",
+        "exit:_traceml_internal:optimizer_step",
+        "enter:_traceml_internal:optimizer_step",
+        "exit:_traceml_internal:optimizer_step",
+    ]
+
+
+def test_lightning_next_forward_closes_an_open_optimizer_region(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        lightning_integration,
+        "timed_region",
+        _ordered_fake_timed_region(calls),
+    )
+
+    class FakeModule(nn.Module):
+        def training_step(self, value):
+            return self(value)
+
+        def forward(self, value):
+            return value
+
+    trainer = SimpleNamespace(training=True, strategy=None)
+    module = FakeModule()
+    callback = lightning_integration.TraceMLCallback()
+    callback.setup(trainer, module, stage="fit")
+
+    callback.on_train_start(trainer, module)
+    callback._step_capture = step_events.begin_step_capture()
+    callback.on_before_optimizer_step(trainer, module, optimizer=None)
+    module.training_step(
+        1
+    )  # the next forward (manual optimization, second step)
+
+    assert calls == [
+        "enter:_traceml_internal:optimizer_step",
+        "exit:_traceml_internal:optimizer_step",
+        "enter:_traceml_internal:forward_time",
+        "exit:_traceml_internal:forward_time",
+    ]
+    callback.teardown(trainer, module)
+
+
+def test_lightning_on_exception_discards_and_restores(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+    calls = []
+    discarded = []
+    monkeypatch.setattr(
+        lightning_integration,
+        "timed_region",
+        _ordered_fake_timed_region(calls),
+    )
+    monkeypatch.setattr(
+        lightning_integration,
+        "abort_step_capture",
+        lambda capture: discarded.append("discard") or True,
+    )
+    monkeypatch.setattr(
+        lightning_integration, "StepMemoryTracker", _FakeMemoryTracker
+    )
+
+    class FakeStrategy:
+        root_device = "cpu"
+
+        def batch_to_device(self, batch, *args, **kwargs):
+            return batch
+
+    strategy = FakeStrategy()
+    original_transfer = strategy.batch_to_device
+    trainer = SimpleNamespace(training=True, strategy=strategy)
+
+    class FakeModule(nn.Module):
+        def training_step(self, value):
+            return self(value)
+
+        def forward(self, value):
+            return value
+
+    module = FakeModule()
+    callback = lightning_integration.TraceMLCallback()
+    callback.setup(trainer, module, stage="fit")
+    assert discarded == ["discard"]  # discard any pre-fit events
+    discarded.clear()
+    callback.on_train_start(trainer, module)
+    callback.on_train_batch_start(trainer, module, batch=None, batch_idx=0)
+    callback.on_before_backward(trainer, module, loss=None)
+    assert callback._traceml_step_ctx is not None
+    assert callback._backward_ctx is not None
+
+    callback.on_exception(trainer, module, RuntimeError("boom"))
+
+    assert calls[-2:] == [
+        "exit:_traceml_internal:backward_time",
+        "exit:_traceml_internal:step_time",
+    ]
+    assert discarded == ["discard"]
+    assert callback._traceml_step_ctx is None
+    assert callback._backward_ctx is None
+    assert callback._optimizer_ctx is None
+    assert "training_step" not in module.__dict__
+    assert not module._forward_hooks
+    assert not module._forward_pre_hooks
+    assert strategy.batch_to_device.__func__ is original_transfer.__func__
+
+    # A repeated call or a later teardown raises nothing and leaves the
+    # callback in the same clean state (aborting an empty capture is a no-op).
+    callback.on_exception(trainer, module, RuntimeError("again"))
+    callback.teardown(trainer, module)
+    assert len(discarded) == 3
+    assert callback._traceml_step_ctx is None
+    assert "training_step" not in module.__dict__
+    assert not module._forward_hooks
+    assert not module._forward_pre_hooks
+
+
+def test_lightning_dataloader_scope_tracks_the_trainer_stage(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+    events = []
+    predicates = []
+
+    class FakeScope:
+        def __init__(self, enabled):
+            predicates.append(enabled)
+
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, *exc):
+            events.append("exit")
+            return False
+
+    monkeypatch.setattr(
+        lightning_integration, "dataloader_timing_scope", FakeScope
+    )
+    trainer = SimpleNamespace(training=False, strategy=None, callbacks=[])
+    module = nn.Linear(2, 2)
+    callback = lightning_integration.TraceMLCallback()
+    trainer.callbacks = [callback]
+
+    callback.setup(trainer, module, stage="fit")
+    assert events == ["enter"]
+    assert predicates[0]() is False
+
+    trainer.training = True
+    assert predicates[0]() is True
+
+    callback.teardown(trainer, module)
+    assert events == ["enter", "exit"]
+
+
+def test_strategy_owned_accumulation_skips_optimizer_occurrence(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        lightning_integration,
+        "timed_region",
+        _ordered_fake_timed_region(calls),
+    )
+    trainer = SimpleNamespace(
+        training=True,
+        strategy=None,
+        fit_loop=SimpleNamespace(_should_accumulate=lambda: True),
+    )
+    module = SimpleNamespace(automatic_optimization=True)
+    callback = lightning_integration.TraceMLCallback()
+
+    callback.on_before_optimizer_step(trainer, module, optimizer=None)
+
+    assert calls == []
+
+
+def test_lightning_backward_closes_an_open_optimizer_region(monkeypatch):
+    # Manual optimization whose second path never calls pl_module.forward:
+    # the backward after opt_g.step() must end the optimizer region.
+    _enable_callback_without_lightning(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        lightning_integration,
+        "timed_region",
+        _ordered_fake_timed_region(calls),
+    )
+    trainer = SimpleNamespace(training=True, strategy=None)
+    module = nn.Linear(2, 2)
+    callback = lightning_integration.TraceMLCallback()
+
+    callback.on_before_optimizer_step(trainer, module, optimizer=None)
+    callback.on_before_backward(trainer, module, loss=None)
+    callback.on_after_backward(trainer, module)
+
+    assert calls == [
+        "enter:_traceml_internal:optimizer_step",
+        "exit:_traceml_internal:optimizer_step",
+        "enter:_traceml_internal:backward_time",
+        "exit:_traceml_internal:backward_time",
+    ]
+
+
+def test_lightning_kill_switch_flipped_mid_batch_abandons_the_batch(
+    monkeypatch,
+):
+    _enable_callback_without_lightning(monkeypatch)
+    monkeypatch.delenv("TRACEML_DISABLED", raising=False)
+    monkeypatch.setattr(step_events, "_ACTIVE_STEP_CAPTURE", StepCapture())
+    discarded = []
+    monkeypatch.setattr(
+        lightning_integration,
+        "abort_step_capture",
+        lambda capture: discarded.append("discard") or True,
+    )
+    calls = []
+    monkeypatch.setattr(
+        lightning_integration,
+        "timed_region",
+        _ordered_fake_timed_region(calls),
+    )
+    monkeypatch.setattr(
+        lightning_integration, "StepMemoryTracker", _FakeMemoryTracker
+    )
+    trainer = SimpleNamespace(training=True, strategy=None)
+    module = nn.Linear(2, 2)
+    callback = lightning_integration.TraceMLCallback()
+
+    callback.on_train_batch_start(trainer, module, batch=None, batch_idx=0)
+    assert callback._traceml_step_ctx is not None
+    monkeypatch.setenv("TRACEML_DISABLED", "1")
+    callback.on_train_batch_end(
+        trainer, module, outputs=None, batch=None, batch_idx=0
+    )
+
+    # The envelope was closed and the capture dropped, nothing advanced.
+    assert callback._traceml_step_ctx is None
+    assert discarded == ["discard"]
+    assert calls == [
+        "enter:_traceml_internal:step_time",
+        "exit:_traceml_internal:step_time",
+    ]
+
+    # Switched back on: the next batch opens its own envelope.
+    monkeypatch.delenv("TRACEML_DISABLED")
+    callback.on_train_batch_start(trainer, module, batch=None, batch_idx=1)
+    assert calls[-1] == "enter:_traceml_internal:step_time"
+    callback._close_context("_traceml_step_ctx")
+
+
+def test_lightning_teardown_discards_whatever_is_still_pending(monkeypatch):
+    _enable_callback_without_lightning(monkeypatch)
+    discarded = []
+    monkeypatch.setattr(
+        lightning_integration,
+        "abort_step_capture",
+        lambda capture: discarded.append("discard") or True,
+    )
+    trainer = SimpleNamespace(training=True, strategy=None)
+    module = nn.Linear(2, 2)
+    callback = lightning_integration.TraceMLCallback()
+    callback.setup(trainer, module, stage="fit")
+
+    callback.teardown(trainer, module)
+
+    assert discarded == ["discard", "discard"]  # setup and teardown
+    assert "training_step" not in module.__dict__
+    assert not module._forward_hooks
+    assert not module._forward_pre_hooks
+
+
+def test_lightning_warns_when_the_transfer_wrapper_is_missing(
+    monkeypatch, capsys
+):
+    _enable_callback_without_lightning(monkeypatch)
+    monkeypatch.delenv("TRACEML_DISABLED", raising=False)
+    # No strategy on the trainer: setup cannot wrap batch_to_device.
+    trainer = SimpleNamespace(training=True, strategy=None)
+    module = nn.Linear(2, 2)
+    callback = lightning_integration.TraceMLCallback()
+    callback.setup(trainer, module, stage="fit")
+    assert callback._original_batch_to_device is None
+
+    callback.on_train_start(trainer, module)
+
+    err = capsys.readouterr().err
+    assert "batch_to_device is not wrapped" in err
+    callback.teardown(trainer, module)
