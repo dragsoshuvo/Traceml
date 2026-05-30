@@ -1,0 +1,336 @@
+# Copyright 2026 OptAI UG (haftungsbeschraenkt)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Run a user script with a best-effort TraceML runtime around it.
+
+The executor is intentionally transparent to user failures: Python and
+torchrun remain responsible for exception reporting and process exit status.
+"""
+
+import os
+import runpy
+import sys
+from importlib import import_module
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Union
+
+from traceml_ai.loggers.error_log import (
+    get_error_logger,
+    log_internal_exception,
+    setup_error_logger,
+)
+from traceml_ai.runtime.launch_context import (
+    LaunchContext,
+    script_execution_context,
+)
+from traceml_ai.runtime.lifecycle import NoOpRuntime
+from traceml_ai.runtime.lifecycle import start_runtime as start_runtime_handle
+from traceml_ai.runtime.runtime import TraceMLRuntime
+from traceml_ai.runtime.settings import (
+    DEFAULT_FINALIZE_TIMEOUT_SEC,
+    DEFAULT_INTERVAL_SEC,
+    DEFAULT_UI_MODE,
+    AggregatorTransportSettings,
+    TraceMLSettings,
+)
+from traceml_ai.telemetry.retention import (
+    DEFAULT_HISTORY_RETENTION_S,
+    parse_history_retention,
+)
+
+DEFAULT_LOGS_DIR = "./logs"
+DEFAULT_AGGREGATOR_HOST = "127.0.0.1"
+DEFAULT_AGGREGATOR_BIND_HOST = "127.0.0.1"
+DEFAULT_AGGREGATOR_PORT = 29765
+DEFAULT_PROFILE = "run"
+
+
+def _parse_optional_positive_int(value: Optional[str]) -> Optional[int]:
+    """Parse an optional positive integer from an environment variable."""
+    if value is None or str(value).strip() == "":
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("Expected a positive integer.")
+    return parsed
+
+
+def _log_runtime_exception(message: str, error: BaseException) -> None:
+    """Record a TraceML failure without raising or copying user context."""
+    try:
+        setup_error_logger(role="rank")
+        log_internal_exception(
+            get_error_logger("TraceMLExecutor"),
+            f"[TraceML] {message}",
+            error,
+        )
+    except Exception:
+        pass
+
+
+def read_traceml_env() -> Dict[str, Any]:
+    """
+    Read TraceML configuration injected by the CLI launcher.
+
+    All configuration is passed through environment variables so that:
+    - user scripts remain untouched
+    - the executor runs in a clean child process
+    - runtime behavior is centrally controlled by the launcher
+
+    Backward compatibility:
+    - TRACEML_UI_MODE is preferred
+    - TRACEML_MODE is still accepted
+
+     Supported display modes:
+    - cli
+    - dashboard
+    - summary
+    """
+    ui_mode = os.environ.get(
+        "TRACEML_UI_MODE",
+        os.environ.get("TRACEML_MODE", DEFAULT_UI_MODE),
+    )
+
+    return {
+        "script_path": os.environ["TRACEML_SCRIPT_PATH"],
+        "profile": os.environ.get("TRACEML_PROFILE", DEFAULT_PROFILE),
+        "mode": ui_mode,
+        "interval": float(
+            os.environ.get("TRACEML_INTERVAL", str(DEFAULT_INTERVAL_SEC))
+        ),
+        "enable_logging": (
+            os.environ.get("TRACEML_ENABLE_LOGGING", "0") == "1"
+        ),
+        "logs_dir": os.environ.get("TRACEML_LOGS_DIR", DEFAULT_LOGS_DIR),
+        "aggregator_host": os.environ.get(
+            "TRACEML_AGGREGATOR_HOST",
+            DEFAULT_AGGREGATOR_HOST,
+        ),
+        "aggregator_bind_host": os.environ.get(
+            "TRACEML_AGGREGATOR_BIND_HOST",
+            DEFAULT_AGGREGATOR_BIND_HOST,
+        ),
+        "aggregator_port": int(
+            os.environ.get(
+                "TRACEML_AGGREGATOR_PORT",
+                str(DEFAULT_AGGREGATOR_PORT),
+            )
+        ),
+        "session_id": os.environ.get("TRACEML_SESSION_ID", ""),
+        "run_nonce": os.environ.get("TRACEML_RUN_NONCE", ""),
+        "finalize_timeout_sec": float(
+            os.environ.get(
+                "TRACEML_FINALIZE_TIMEOUT_SEC",
+                str(DEFAULT_FINALIZE_TIMEOUT_SEC),
+            )
+        ),
+        "history_retention_s": parse_history_retention(
+            os.environ.get(
+                "TRACEML_HISTORY_RETENTION",
+                str(DEFAULT_HISTORY_RETENTION_S),
+            )
+        ),
+        "expected_world_size": int(
+            os.environ.get("TRACEML_EXPECTED_WORLD_SIZE", "1")
+        ),
+        "trace_max_steps": _parse_optional_positive_int(
+            os.environ.get("TRACEML_TRACE_MAX_STEPS")
+        ),
+        "disable_traceml": os.environ.get("TRACEML_DISABLED", "0") == "1",
+    }
+
+
+def extract_script_args() -> list[str]:
+    """
+    Extract arguments intended for the user script.
+
+    Convention:
+        traceml run train.py --args --epochs 10 --lr 1e-3
+
+    Everything after '--' is forwarded to the target script.
+    If torchrun strips the separator before this executor sees argv, all
+    remaining executor argv entries are user script arguments.
+    """
+    try:
+        separator_index = sys.argv.index("--")
+        return sys.argv[separator_index + 1 :]
+    except ValueError:
+        return sys.argv[1:]
+
+
+def build_runtime_settings(cfg: Dict[str, Any]) -> TraceMLSettings:
+    """
+    Build TraceML runtime settings from the executor configuration.
+
+    Keeping settings creation separate makes runtime startup easier to test
+    and keeps the lifecycle code focused on orchestration.
+    """
+    return TraceMLSettings(
+        mode=str(cfg["mode"]),
+        profile=str(cfg["profile"]),
+        sampler_interval_sec=float(cfg["interval"]),
+        enable_logging=bool(cfg["enable_logging"]),
+        logs_dir=str(cfg["logs_dir"]),
+        session_id=str(cfg["session_id"]),
+        run_nonce=str(cfg.get("run_nonce", "") or ""),
+        # The launcher hands every rank the run's session id.
+        session_source="explicit" if cfg["session_id"] else "",
+        finalize_timeout_sec=float(
+            cfg.get("finalize_timeout_sec", DEFAULT_FINALIZE_TIMEOUT_SEC)
+        ),
+        history_retention_s=float(
+            cfg.get("history_retention_s", DEFAULT_HISTORY_RETENTION_S)
+        ),
+        expected_world_size=int(cfg.get("expected_world_size", 1)),
+        trace_max_steps=cfg.get("trace_max_steps"),
+        aggregator=AggregatorTransportSettings(
+            connect_host=str(cfg["aggregator_host"]),
+            bind_host=str(cfg["aggregator_bind_host"]),
+            port=int(cfg["aggregator_port"]),
+        ),
+    )
+
+
+def start_runtime(cfg: Dict[str, Any]) -> Union[TraceMLRuntime, NoOpRuntime]:
+    """
+    Initialize and start the TraceML runtime.
+
+    Runtime startup must happen before user code executes so TraceML can:
+    - attach hooks
+    - start background samplers
+    - observe early runtime behavior
+
+    Returns
+    -------
+    TraceMLRuntime | NoOpRuntime
+        A started TraceMLRuntime on success, otherwise a NoOpRuntime.
+
+    Notes
+    -----
+    This function is fail-open by design. If TraceML cannot initialize, the
+    user script still runs.
+    """
+    if bool(cfg.get("disable_traceml")):
+        return NoOpRuntime()
+
+    try:
+        settings = build_runtime_settings(cfg)
+        handle = start_runtime_handle(settings, fail_open=False)
+        return handle.runtime
+    except Exception as error:
+        _log_runtime_exception("Failed to start TraceMLRuntime", error)
+        return NoOpRuntime()
+
+
+def stop_runtime(
+    runtime: Union[TraceMLRuntime, NoOpRuntime],
+) -> None:
+    """
+    Stop the TraceML runtime.
+
+    This is best-effort and must never raise. Runtime shutdown failures should
+    not mask user-script failures or alter exit behavior.
+    """
+    try:
+        runtime.stop()
+
+        # Summaries are intentionally disabled here for now.
+        # TODO: Re-enable once summary behavior is finalized.
+        # runtime.log_summaries(path=None)
+
+    except Exception as error:
+        _log_runtime_exception("Error during TraceML runtime shutdown", error)
+
+
+def run_user_script(script_path: str, script_args: list[str]) -> None:
+    """
+    Execute the user script in-process using ``runpy``.
+
+    TraceML preserves the user's original launch cwd while also exposing the
+    script directory as ``sys.path[0]`` so local imports and relative file
+    access behave like a normal ``python`` or ``torchrun`` script launch.
+    """
+    launch_context = LaunchContext.from_env()
+    resolved_script_path = str(Path(script_path).resolve())
+
+    with script_execution_context(
+        script_path=resolved_script_path,
+        script_args=script_args,
+        launch_context=launch_context,
+    ):
+        runpy.run_path(resolved_script_path, run_name="__main__")
+
+
+def _execute_with_runtime() -> None:
+    """Execute the user script while owning one TraceML runtime lifecycle.
+
+    User exceptions propagate unchanged to native Python/torchrun stderr. The
+    ``finally`` block guarantees Python-level cleanup without converting
+    ``SystemExit``, ``KeyboardInterrupt``, or ordinary exceptions into
+    TraceML-specific failures.
+    """
+    cfg = read_traceml_env()
+    runtime = start_runtime(cfg)
+    import_hooks = []
+
+    if (
+        isinstance(runtime, TraceMLRuntime)
+        and str(cfg.get("profile", DEFAULT_PROFILE)) == "run"
+        and not bool(cfg.get("disable_traceml"))
+        and os.environ.get("TRACEML_DISABLED") != "1"
+    ):
+        for name in ("hf_auto", "lightning_auto", "rfdetr_auto"):
+            try:
+                adapter = import_module(f"traceml_ai.runtime.{name}")
+                import_hooks.append((adapter, adapter.install()))
+            except Exception as error:
+                _log_runtime_exception(
+                    f"Failed to register {name} import hook", error
+                )
+
+    try:
+        run_user_script(str(cfg["script_path"]), extract_script_args())
+    finally:
+        for adapter, finder in import_hooks:
+            try:
+                adapter.uninstall(finder)
+            except Exception as error:
+                _log_runtime_exception(
+                    f"Failed to remove {adapter.__name__} import hook", error
+                )
+        stop_runtime(runtime)
+
+
+def _run_with_torchelastic_record(
+    entrypoint: Callable[[], None],
+) -> None:
+    """Use torchrun's native error recorder when torchrun configured one.
+
+    The import remains lazy so torch-free execution paths do not acquire a
+    PyTorch dependency. Older or incomplete PyTorch installations fall back to
+    normal Python propagation rather than preventing the user script from
+    running.
+    """
+    if not os.environ.get("TORCHELASTIC_ERROR_FILE"):
+        entrypoint()
+        return
+
+    try:
+        from torch.distributed.elastic.multiprocessing.errors import record
+    except ImportError:
+        entrypoint()
+        return
+
+    record(entrypoint)()
+
+
+def main() -> None:
+    """Run the transparent executor, using torchrun error recording if set."""
+    _run_with_torchelastic_record(_execute_with_runtime)
+
+
+if __name__ == "__main__":
+    main()
