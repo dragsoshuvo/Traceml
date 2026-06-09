@@ -1,0 +1,605 @@
+import os
+import sys
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+
+from traceml_ai.instrumentation.patches.dataloader_patch import (
+    dataloader_timing_scope,
+)
+from traceml_ai.instrumentation.patches.h2d_auto_timer_patch import (
+    h2d_auto_timer,
+)
+from traceml_ai.instrumentation.step_events import (
+    TimeScope,
+    abort_step_capture,
+    begin_step_capture,
+    complete_step_capture,
+)
+from traceml_ai.integrations._lightning_forward import ForwardObserver
+from traceml_ai.runtime.state import (
+    get_trace_session_state,
+    mark_trace_step_flushed,
+)
+from traceml_ai.utils.step_memory import StepMemoryTracker
+from traceml_ai.utils.timing import timed_region
+
+if TYPE_CHECKING:
+    from lightning.pytorch.callbacks import Callback as _CallbackBase
+else:
+    _CallbackBase = object
+
+
+def _dedupe_callback_bases(bases: tuple[type, ...]) -> tuple[type, ...]:
+    """Return callback bases without duplicates while preserving order."""
+    out: list[type] = []
+    for base in bases:
+        if any(base is existing for existing in out):
+            continue
+        out.append(base)
+    return tuple(out)
+
+
+def _build_callback_base(bases: tuple[type, ...]) -> Any:
+    """Build one runtime callback base from available namespace bases."""
+    unique_bases = _dedupe_callback_bases(bases)
+    if not unique_bases:
+        return SimpleNamespace(base=object, available=False)
+
+    if len(unique_bases) == 1:
+        return SimpleNamespace(base=unique_bases[0], available=True)
+
+    try:
+        base = type(
+            "_TraceMLLightningCallbackBase",
+            unique_bases,
+            {},
+        )
+    except TypeError:
+        # If the namespaces expose incompatible callback classes, prefer the
+        # legacy package because that is the namespace most likely to hit the
+        # mixed-import error this compatibility path fixes.
+        base = unique_bases[-1]
+
+    return SimpleNamespace(base=base, available=True)
+
+
+def _resolve_callback_base() -> Any:
+    """
+    Build a callback base accepted by either Lightning namespace.
+
+    ``lightning.pytorch`` and ``pytorch_lightning`` can be installed side by
+    side, but their ``Callback`` classes are not always identical. Inheriting
+    from every available callback base lets the same TraceML callback work with
+    whichever Trainer namespace the user already has.
+    """
+    bases: list[type] = []
+
+    try:
+        from lightning.pytorch.callbacks import Callback as LightningCallback
+
+        bases.append(LightningCallback)
+    except ImportError:
+        pass
+
+    try:
+        from pytorch_lightning.callbacks import (
+            Callback as PyTorchLightningCallback,
+        )
+
+        bases.append(PyTorchLightningCallback)
+    except ImportError:
+        pass
+
+    return _build_callback_base(tuple(bases))
+
+
+if not TYPE_CHECKING:
+    _callback_resolution = _resolve_callback_base()
+    _CallbackBase = _callback_resolution.base
+    IS_LIGHTNING_AVAILABLE = bool(_callback_resolution.available)
+else:
+    IS_LIGHTNING_AVAILABLE = True
+
+
+_WARNINGS = set()
+_AUTO_MESSAGE_PRINTED = False
+
+
+def _traceml_disabled() -> bool:
+    """Read the TraceML kill switch dynamically."""
+    return os.environ.get("TRACEML_DISABLED") == "1"
+
+
+def init():
+    """
+    Initialize TraceML for PyTorch Lightning runs.
+
+    Lightning owns the training loop, so TraceMLCallback owns step boundaries,
+    capture completion, and framework hook integration. The integration init
+    enables DataLoader fetch timing plus the H2D Tensor.to patch. The callback
+    opens the traced step around Lightning's batch transfer (so H2D is inside
+    it), turns H2D timing on only there, and observes outermost module calls
+    during training_step for forward timing. Fetches of non-training loaders are
+    excluded.
+    """
+    import traceml_ai as traceml
+
+    return traceml.init(
+        mode="selective",
+        patch_dataloader=True,
+        patch_h2d=True,
+    )
+
+
+def _auto_config_is_compatible(config) -> bool:
+    """Return whether an existing init config matches Lightning auto mode."""
+    return config is None or (
+        config.mode == "selective"
+        and config.patch_dataloader
+        and config.patch_h2d
+        and not config.patch_forward
+        and not config.patch_backward
+    )
+
+
+def _warn_once(key, message):
+    if key not in _WARNINGS:
+        _WARNINGS.add(key)
+        try:
+            print(f"[TraceML] {message}", file=sys.stderr)
+        except Exception:
+            pass
+
+
+def _announce_auto(trainer):
+    global _AUTO_MESSAGE_PRINTED
+    message = getattr(trainer, "_traceml_auto_status", None)
+    try:
+        if message and not _AUTO_MESSAGE_PRINTED and trainer.is_global_zero:
+            framework = getattr(
+                trainer, "_traceml_auto_framework", "PyTorch Lightning"
+            )
+            print(
+                f"[TraceML] {framework} Trainer detected; {message}",
+                flush=True,
+            )
+            _AUTO_MESSAGE_PRINTED = True
+    except Exception:
+        pass
+
+
+def _log_lightning_error(message: str, exc: Exception) -> None:
+    """
+    Log TraceML callback failures without interrupting Lightning training.
+
+    The callback is best-effort instrumentation. TraceML launcher runs configure
+    the shared error logger; direct callback users still get the previous stderr
+    fallback if logging has not been configured.
+    """
+    try:
+        from traceml_ai.loggers.error_log import get_error_logger
+
+        get_error_logger("LightningIntegration").exception(
+            "[TraceML] %s", message
+        )
+    except Exception:
+        pass
+
+    try:
+        print(f"[TraceML] {message}: {exc}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _device_is_cuda(device) -> bool:
+    device_type = getattr(device, "type", None)
+    if device_type is not None:
+        return str(device_type).lower() == "cuda"
+    return str(device).lower().startswith("cuda")
+
+
+def _lightning_uses_cuda(trainer, pl_module) -> bool:
+    strategy = getattr(trainer, "strategy", None)
+    root_device = getattr(strategy, "root_device", None)
+    if root_device is not None:
+        return _device_is_cuda(root_device)
+
+    module_device = getattr(pl_module, "device", None)
+    return _device_is_cuda(module_device)
+
+
+def _lightning_is_accumulating(trainer, pl_module) -> bool:
+    """Return whether Lightning is still accumulating the current step.
+
+    This gates both optimizer-event recording and capture completion. Manual
+    optimization remains batch-scoped and returns ``False``. For automatic
+    optimization, Lightning's fit-loop decision accounts for accumulation
+    schedules and shorter final groups. It also distinguishes internal
+    strategy calls, including DeepSpeed, from parameter-update boundaries.
+    """
+    if not getattr(pl_module, "automatic_optimization", False):
+        return False
+
+    should_accumulate = getattr(
+        getattr(trainer, "fit_loop", None),
+        "_should_accumulate",
+        None,
+    )
+    if not callable(should_accumulate):
+        return False
+    try:
+        return bool(should_accumulate())
+    except Exception as e:
+        _log_lightning_error("accumulation state check failed", e)
+        return False
+
+
+class TraceMLCallback(_CallbackBase):
+    """
+    Official TraceML Callback for PyTorch Lightning.
+
+    One TraceML step is one Lightning optimizer-update boundary. Without
+    gradient accumulation this is one training batch. With automatic gradient
+    accumulation, the capture remains open across the group's micro-batches;
+    their repeated timing events are aggregated by ``StepTimeSampler`` and the
+    memory tracker reports the peak across the group. Fetches of validation,
+    sanity-check, test and predict loaders are kept out of Input Wait. A group
+    that raises is discarded, not published.
+    """
+
+    def __init__(self):
+        if not IS_LIGHTNING_AVAILABLE:
+            raise ImportError(
+                "Install either 'lightning' or 'pytorch-lightning' to use "
+                "TraceML's Lightning integration."
+            )
+        super().__init__()
+        self._traceml_step_ctx = None
+        self._backward_ctx = None
+        self._optimizer_ctx = None
+        self._batch_to_device_strategy = None
+        self._original_batch_to_device = None
+        self._forward = ForwardObserver(
+            self,
+            disabled=_traceml_disabled,
+            on_error=_log_lightning_error,
+            region=timed_region,
+        )
+        self._warned_missing_forward = False
+        self._step_capture = None
+        self._dataloader_timing_scope = None
+
+        self._mem_tracker = None
+        self._memory_window_attempted = False
+
+    def _close_context(self, ctx_attr: str) -> None:
+        ctx = getattr(self, ctx_attr, None)
+        if ctx is None:
+            return
+        try:
+            ctx.__exit__(None, None, None)
+        except Exception as e:
+            _log_lightning_error(f"{ctx_attr} cleanup failed", e)
+        setattr(self, ctx_attr, None)
+
+    def _close_all_contexts(self) -> None:
+        for ctx_attr in (
+            "_backward_ctx",
+            "_optimizer_ctx",
+            "_traceml_step_ctx",
+        ):
+            self._close_context(ctx_attr)
+
+    def _open_step_region(self) -> None:
+        """
+        Open this micro-batch's traced region inside the active step capture.
+
+        ``begin`` adopts input events recorded before this point. During
+        gradient accumulation, later micro-batches reuse the same capture but
+        receive their own timed region; the sampler sums those regions when
+        the completed group is published.
+        """
+        if self._traceml_step_ctx is not None:
+            return
+        if self._step_capture is None:
+            self._step_capture = begin_step_capture()
+        try:
+            ctx = timed_region(
+                "_traceml_internal:step_time",
+                scope=TimeScope.STEP,
+                record_gpu_events=True,
+            )
+            ctx.__enter__()
+        except Exception as e:
+            _log_lightning_error("step region open failed", e)
+            return
+        self._traceml_step_ctx = ctx
+
+    def _enter_dataloader_timing_scope(self, trainer) -> None:
+        """Record DataLoader fetches only while Lightning is training."""
+        if self._dataloader_timing_scope is not None:
+            return
+        try:
+            scope = dataloader_timing_scope(
+                lambda: bool(getattr(trainer, "training", False))
+            )
+            scope.__enter__()
+        except Exception as e:
+            _log_lightning_error("DataLoader timing scope enter failed", e)
+            return
+        self._dataloader_timing_scope = scope
+
+    def _exit_dataloader_timing_scope(self) -> None:
+        """Release the framework-level DataLoader timing policy once."""
+        scope, self._dataloader_timing_scope = (
+            self._dataloader_timing_scope,
+            None,
+        )
+        if scope is None:
+            return
+        try:
+            scope.__exit__(None, None, None)
+        except Exception as e:
+            _log_lightning_error("DataLoader timing scope exit failed", e)
+
+    def setup(self, trainer, pl_module, stage=None):
+        if _traceml_disabled():
+            return
+        if stage == "fit":
+            # Pre-fit preview fetches are outside the training measurement.
+            self._abandon_pending(pl_module)
+        self._enter_dataloader_timing_scope(trainer)
+        self._wrap_batch_to_device(trainer, pl_module)
+
+    def on_train_start(self, trainer, pl_module):
+        if _traceml_disabled():
+            return
+        _announce_auto(trainer)
+        # Attach after EMA copies and checkpoint restoration are complete.
+        try:
+            self._forward.install(
+                trainer, pl_module, self._forward_target(pl_module)
+            )
+        except Exception as e:
+            _log_lightning_error("forward timing unavailable", e)
+        # Fail loud (never raise) when the init config will not capture the
+        # patch-gated streams this callback owes. Forward, backward, optimizer
+        # and the step envelope are timed by the callback itself.
+        try:
+            from traceml_ai.integrations._capability import (
+                warn_if_missing_streams,
+            )
+
+            warn_if_missing_streams(
+                "Lightning TraceMLCallback",
+                requires={"dataloader_fetch", "h2d"},
+                advice="Call traceml_ai.integrations.lightning.init() before training to enable them.",
+            )
+        except Exception as e:
+            _log_lightning_error("capability check failed", e)
+        if self._original_batch_to_device is None:
+            # The config check above cannot see this: without the wrapper the
+            # H2D transfer is not timed and the traced step opens late.
+            print(
+                "[TraceML] Lightning strategy.batch_to_device is not wrapped; "
+                "H2D will not be timed and the traced step starts at "
+                "on_train_batch_start.",
+                file=sys.stderr,
+            )
+
+    def _forward_target(self, pl_module):
+        """Return the module called by the framework's training step."""
+        return pl_module
+
+    def _wrap_batch_to_device(self, trainer, pl_module) -> None:
+        if self._original_batch_to_device is not None:
+            return
+
+        strategy = getattr(trainer, "strategy", None)
+        if strategy is None:
+            return
+
+        original = strategy.batch_to_device
+
+        def wrapped_batch_to_device(batch, *args, **kwargs):
+            if _traceml_disabled() or not getattr(trainer, "training", True):
+                return original(batch, *args, **kwargs)
+            # Lightning moves the batch before on_train_batch_start fires, so
+            # the traced step opens here to keep the transfer inside it.
+            self._open_step_region()
+            if not _lightning_uses_cuda(trainer, pl_module):
+                return original(batch, *args, **kwargs)
+            with h2d_auto_timer():
+                return original(batch, *args, **kwargs)
+
+        try:
+            strategy.batch_to_device = wrapped_batch_to_device
+        except Exception as e:
+            _log_lightning_error("H2D batch transfer wrap failed", e)
+            return
+
+        self._batch_to_device_strategy = strategy
+        self._original_batch_to_device = original
+
+    def teardown(self, trainer, pl_module, stage=None):
+        # Anything recorded since the last completed step (an accumulation
+        # group interrupted before its end, a tuner trial stopped mid-fit)
+        # must not leak into the next fit in this process.
+        self._abandon_pending(pl_module)
+        self._forward.restore()
+        self._restore_batch_to_device()
+        self._exit_dataloader_timing_scope()
+
+    def _abandon_pending(self, pl_module) -> None:
+        """
+        Close open regions and drop everything recorded since the last step.
+
+        Nothing is published and the step counter is left where it was. The
+        active capture is process-wide, so this also drops any other
+        step-scoped events recorded since the last completed step.
+        """
+        try:
+            self._close_all_contexts()
+            capture = self._step_capture
+            self._step_capture = None
+            self._mem_tracker = None
+            self._memory_window_attempted = False
+            self._forward.reset_calls()
+            abort_step_capture(
+                capture if capture is not None else begin_step_capture()
+            )
+        except Exception as e:
+            _log_lightning_error("pending-step cleanup failed", e)
+
+    def on_exception(self, trainer, pl_module, exception):
+        """
+        Abandon the current incomplete step without publishing it.
+
+        Lightning calls this hook, not ``teardown``, when training raises.
+        The open timing regions are closed; every micro-batch accumulated
+        since the prior update, plus the pending memory snapshot, is discarded.
+        The step counter is left where it was, the wrappers are restored, and
+        the user's exception propagates untouched.
+        """
+        self._abandon_pending(pl_module)
+        self._forward.restore()
+        self._restore_batch_to_device()
+        self._exit_dataloader_timing_scope()
+
+    def _restore_batch_to_device(self) -> None:
+        strategy = self._batch_to_device_strategy
+        original = self._original_batch_to_device
+        if strategy is None or original is None:
+            return
+
+        try:
+            strategy.batch_to_device = original
+        except Exception as e:
+            _log_lightning_error("H2D batch transfer restore failed", e)
+        finally:
+            self._batch_to_device_strategy = None
+            self._original_batch_to_device = None
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        if _traceml_disabled():
+            return
+        # Normally already open from the batch_to_device wrapper; this is the
+        # fallback for loops that hand the iterator to training_step and
+        # never call batch_to_device.
+        self._open_step_region()
+
+        # Reset CUDA peak counters once per optimizer-update group. Keeping the
+        # tracker across accumulating micro-batches makes the final reading the
+        # peak for the complete TraceML step.
+        if self._memory_window_attempted:
+            return
+        self._memory_window_attempted = True
+        try:
+            mem_tracker = StepMemoryTracker(pl_module)
+            mem_tracker.reset()
+            self._mem_tracker = mem_tracker
+        except Exception as e:
+            _log_lightning_error("memory reset failed", e)
+            self._mem_tracker = None
+
+    def on_before_backward(self, trainer, pl_module, loss):
+        if _traceml_disabled():
+            return
+        # A backward after an optimizer step (manual optimization, several
+        # steps per batch) ends that step's region; it must not absorb the
+        # next backward.
+        self._close_context("_optimizer_ctx")
+        self._close_context("_backward_ctx")
+        self._backward_ctx = timed_region(
+            "_traceml_internal:backward_time", scope=TimeScope.STEP
+        )
+        self._backward_ctx.__enter__()
+
+    def on_after_backward(self, trainer, pl_module):
+        if _traceml_disabled():
+            return
+        # End backward timing
+        self._close_context("_backward_ctx")
+
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        if _traceml_disabled():
+            return
+        # Strategies such as DeepSpeed call this hook on every micro-batch and
+        # perform gradient accumulation inside ``engine.step``. Match
+        # Lightning's semantic optimizer counter by omitting those internal
+        # accumulation calls from TraceML's optimizer occurrence metric.
+        if _lightning_is_accumulating(trainer, pl_module):
+            return
+
+        # Lightning fires this after the closure (training_step, zero_grad,
+        # backward) and before optimizer.step(). The region stays open until
+        # on_train_batch_end, so on Lightning it also covers the step-interval
+        # LR scheduler update. Manual optimization may step more than once per
+        # batch: close the previous region first so each step is one event.
+        self._close_context("_optimizer_ctx")
+        self._optimizer_ctx = timed_region(
+            "_traceml_internal:optimizer_step", scope=TimeScope.STEP
+        )
+        self._optimizer_ctx.__enter__()
+
+    def on_train_batch_end(
+        self, trainer, pl_module, outputs, batch, batch_idx
+    ):
+        if _traceml_disabled():
+            # The kill switch was flipped during this batch. Close what was
+            # opened and drop what it recorded so the next batch starts on a
+            # fresh envelope instead of merging into this one.
+            self._abandon_pending(pl_module)
+            return
+        # Each micro-batch contributes a separate traced region to the current
+        # capture. Repeated forward, backward, H2D, fetch, and step events are
+        # summed when the completed capture reaches StepTimeSampler.
+        self._close_all_contexts()
+
+        # Lightning's own loop decision includes partial final groups. Keep
+        # their capture and CUDA peak window open until the update boundary.
+        if _lightning_is_accumulating(trainer, pl_module):
+            return
+
+        if (
+            not self._forward.reset_calls()
+            and not self._warned_missing_forward
+        ):
+            self._warned_missing_forward = True
+            _warn_once(
+                "missing-forward",
+                "Lightning completed a traced group without observed module calls; "
+                "Forward timing is unavailable for this training_step.",
+            )
+        # Record one memory peak for the complete optimizer-update group.
+        mem_tracker, self._mem_tracker = self._mem_tracker, None
+        self._memory_window_attempted = False
+        if mem_tracker is not None:
+            try:
+                mem_tracker.record()
+            except Exception as e:
+                _log_lightning_error("record failed", e)
+
+        # Advance once per completed optimizer-update group and publish all of
+        # its micro-batch events under that step number.
+        trace_state = get_trace_session_state()
+        trace_state.advance_step()
+        capture, self._step_capture = self._step_capture, None
+        try:
+            # The envelope always opens before this hook, so the capture is
+            # normally the one this batch began. Falling back to the active
+            # capture keeps a batch that somehow started without one from
+            # holding its events back into the next step.
+            if capture is None:
+                capture = begin_step_capture()
+            complete_step_capture(capture, trace_state.step)
+        except Exception as e:
+            _log_lightning_error("step capture completion failed", e)
+
+        try:
+            mark_trace_step_flushed(trace_state.step)
+        except Exception as e:
+            _log_lightning_error("recording state update failed", e)
+
+
+__all__ = ["TraceMLCallback", "init"]
