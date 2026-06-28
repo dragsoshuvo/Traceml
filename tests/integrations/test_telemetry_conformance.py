@@ -1,0 +1,320 @@
+"""
+Cross-integration telemetry-completeness conformance test (the StreamContract gate).
+
+WHY THIS EXISTS
+---------------
+TraceML integrations can be individually correct yet silently emit INCOMPLETE
+telemetry (a stream goes dark with no error). Diff-review and feature-scoped
+tests catch what is *present*; the costly misses are *absences*. This turns
+"the maintainer remembers HF should emit the same streams as Lightning" into a
+CI gate: each integration DECLARES the telemetry streams it owes, and this test
+runs a tiny in-process CPU integration under the documented `init()` path and
+asserts every declared stream actually emitted >= 1 row. The separate
+``test_hf_real_runtime.py`` gate carries the HF streams through the sampler,
+transport, aggregator, SQLite, and final-summary boundaries.
+
+DISCIPLINE: a new telemetry stream (e.g. all_reduce) is not "done" until it is
+added to REQUIRED_STEP_TIME below AND emitted by every integration that owes it.
+
+SCOPE (Stage 1, additive, zero training-path/import behavior change): POSITIVE
+conformance only — it calls the integration's documented `init()` entry point,
+so it regression-gates that path (e.g. catches a future change that drops the
+DataLoader patch from auto mode). The NEGATIVE control (assert the bare/no-init
+path lacks a stream and that this harness DETECTS it) became feasible when
+upstream #146 removed the legacy import-time auto-init -> Stage 2.
+"""
+
+import importlib.util
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from traceml_ai.instrumentation.step_events import (
+    abort_step_capture,
+    begin_step_capture,
+    drain_step_time_batches,
+)
+
+# --- StreamContract registry -------------------------------------------------
+# Logical stream name -> wire name (TimeEvent.name).
+STEP_TIME_WIRE = {
+    "step_time": "_traceml_internal:step_time",
+    "forward": "_traceml_internal:forward_time",
+    "backward": "_traceml_internal:backward_time",
+    "optimizer": "_traceml_internal:optimizer_step",
+    "dataloader_fetch": "_traceml_internal:dataloader_next",
+    "h2d": "_traceml_internal:h2d_time",  # GPU-only (arming-gated) -> not on CPU
+}
+
+# Each integration declares the STEP-TIME streams it owes on a CPU run.
+# (h2d is GPU-only; step_memory rides a separate queue -> both tracked separately.)
+REQUIRED_STEP_TIME = {
+    "huggingface": {
+        "step_time",
+        "forward",
+        "backward",
+        "optimizer",
+        "dataloader_fetch",  # the #88/#135 stream
+    },
+    "lightning": {
+        "step_time",
+        "forward",
+        "backward",
+        "optimizer",
+        "dataloader_fetch",
+    },
+    "monai": {
+        "step_time",
+        "forward",
+        "backward",
+        "optimizer",
+        # Timed from the engine's own fetch events, not the torch patch.
+        "dataloader_fetch",
+    },
+}
+
+
+def _have(*mods: str) -> bool:
+    return all(importlib.util.find_spec(m) is not None for m in mods)
+
+
+def _drain_step_time_names() -> set[str]:
+    names: set[str] = set()
+    for batch in drain_step_time_batches():
+        for evt in getattr(batch, "events", []):
+            names.add(evt.name)
+    return names
+
+
+# --- Per-integration runnable harnesses --------------------------------------
+def _run_huggingface() -> set[str]:
+    import torch
+    from transformers import (
+        BertConfig,
+        BertForSequenceClassification,
+        Trainer,
+        TrainingArguments,
+    )
+
+    from traceml_ai.integrations.huggingface import (
+        TraceMLTrainerCallback,
+        init as hf_init,
+    )
+
+    class _TinyDS(torch.utils.data.Dataset):
+        def __init__(self, n=20, seq=16, vocab=128, labels=4):
+            self._rows = [
+                {
+                    "input_ids": (torch.arange(seq) % vocab) + (i % 7),
+                    "attention_mask": torch.ones(seq, dtype=torch.long),
+                    "labels": torch.tensor(i % labels),
+                }
+                for i in range(n)
+            ]
+
+        def __len__(self):
+            return len(self._rows)
+
+        def __getitem__(self, i):
+            return self._rows[i]
+
+    # Canonical documented path (#135); == traceml_ai.init(mode="auto"),
+    # idempotent if already initialized with the same effective config.
+    hf_init()
+    drain_step_time_batches()
+    abort_step_capture(begin_step_capture())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        model = BertForSequenceClassification(
+            BertConfig(
+                vocab_size=128,
+                hidden_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                intermediate_size=64,
+                max_position_embeddings=32,
+                num_labels=4,
+            )
+        )
+        args = TrainingArguments(
+            output_dir=str(Path(tmp) / "r"),
+            per_device_train_batch_size=4,
+            max_steps=5,
+            logging_steps=1,
+            use_cpu=not torch.cuda.is_available(),
+            save_strategy="no",
+        )
+        Trainer(
+            model=model,
+            args=args,
+            train_dataset=_TinyDS(),
+            callbacks=[TraceMLTrainerCallback()],
+        ).train()
+
+    return _drain_step_time_names()
+
+
+def _run_lightning(init: bool = True) -> set[str]:
+    import lightning as L
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from traceml_ai.integrations.lightning import (
+        TraceMLCallback,
+    )
+    from traceml_ai.integrations.lightning import init as lightning_init
+
+    class _Tiny(L.LightningModule):
+        def __init__(self):
+            super().__init__()
+            self.net = torch.nn.Linear(8, 4)
+
+        def forward(self, x):
+            return self.net(x)
+
+        def training_step(self, batch, batch_idx):
+            x, y = batch
+            return torch.nn.functional.cross_entropy(self(x), y)
+
+        def configure_optimizers(self):
+            return torch.optim.SGD(self.parameters(), lr=0.1)
+
+    # Canonical documented path: traceml.init(mode="selective",
+    # patch_dataloader=True, patch_h2d=True). Skipped by the negative control.
+    if init:
+        lightning_init()
+    drain_step_time_batches()
+    abort_step_capture(begin_step_capture())
+
+    g = torch.Generator().manual_seed(0)
+    loader = DataLoader(
+        TensorDataset(
+            torch.randn(16, 8, generator=g),
+            torch.randint(0, 4, (16,), generator=g),
+        ),
+        batch_size=4,
+    )
+    trainer = L.Trainer(
+        max_steps=4,
+        accelerator="cpu",
+        devices=1,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        enable_checkpointing=False,
+        logger=False,
+        num_sanity_val_steps=0,
+        callbacks=[TraceMLCallback()],
+    )
+    trainer.fit(_Tiny(), train_dataloaders=loader)
+
+    return _drain_step_time_names()
+
+
+def _run_monai() -> set[str]:
+    import torch
+    from monai.data import DataLoader
+    from monai.engines import SupervisedTrainer
+
+    from traceml_ai.instrumentation.hooks.optimizer_hooks import (
+        reset_optimizer_timing,
+    )
+    from traceml_ai.instrumentation.patches import dataloader_patch
+    from traceml_ai.integrations.monai import TraceMLHandler
+    from traceml_ai.integrations.monai import init as monai_init
+
+    class _TinyDS(torch.utils.data.Dataset):
+        def __len__(self):
+            return 8
+
+        def __getitem__(self, i):
+            return {
+                "image": torch.zeros(1, 8, 8),
+                "label": torch.zeros(1, 8, 8),
+            }
+
+    # The torch fetch patch and the global optimizer hooks are process-wide,
+    # and an integration that ran earlier installs both. Left in place they
+    # would satisfy the fetch and optimizer rows without the handler emitting
+    # anything, so this harness runs without them and puts the patch back for
+    # whatever runs next. The hooks come back on the next auto-mode init.
+    loader_class = torch.utils.data.DataLoader
+    saved_iter = loader_class.__iter__
+    saved_patched = getattr(loader_class, "_traceml_patched", False)
+    loader_class.__iter__ = dataloader_patch._ORIG_DATALOADER_ITER
+    loader_class._traceml_patched = False
+    reset_optimizer_timing()
+
+    try:
+        # Documented path: traceml.init(mode="selective", patch_h2d=True),
+        # which leaves the DataLoader patch off. Input Wait comes from the
+        # engine.
+        config = monai_init()
+        # The one thing this init arms; h2d itself is GPU-only, so the row
+        # below cannot see it going dark.
+        assert config.patch_h2d, "monai.init() must arm H2D timing"
+        drain_step_time_batches()
+        abort_step_capture(begin_step_capture())
+
+        network = torch.nn.Conv2d(1, 1, 3, padding=1)
+        SupervisedTrainer(
+            device=torch.device("cpu"),
+            max_epochs=1,
+            train_data_loader=DataLoader(_TinyDS(), batch_size=2),
+            network=network,
+            optimizer=torch.optim.SGD(network.parameters(), lr=0.1),
+            loss_function=torch.nn.MSELoss(),
+            train_handlers=[TraceMLHandler()],
+        ).run()
+
+        return _drain_step_time_names()
+    finally:
+        loader_class.__iter__ = saved_iter
+        loader_class._traceml_patched = saved_patched
+
+
+# integration -> (runner, required deps). No entry => no runnable harness yet.
+_HARNESSES = {
+    "huggingface": (_run_huggingface, ("torch", "transformers")),
+    "lightning": (_run_lightning, ("torch", "lightning")),
+    "monai": (_run_monai, ("torch", "monai", "ignite")),
+}
+
+
+@pytest.mark.parametrize("integration", sorted(REQUIRED_STEP_TIME))
+def test_declared_step_time_streams_emit(integration: str):
+    """Every declared step-time stream must emit >= 1 row end-to-end."""
+    harness = _HARNESSES.get(integration)
+    if harness is None:
+        pytest.skip(f"no runnable conformance harness for {integration} yet")
+    runner, deps = harness
+    if not _have(*deps):
+        pytest.skip(f"{integration}: required deps not installed: {deps}")
+
+    emitted = runner()
+    required = {STEP_TIME_WIRE[k] for k in REQUIRED_STEP_TIME[integration]}
+    dark = sorted(w for w in required if w not in emitted)
+    assert not dark, (
+        f"{integration}: declared telemetry stream(s) DARK: {dark}. "
+        f"Emitted: {sorted(emitted)}"
+    )
+
+
+def test_lightning_harness_detects_a_dark_stream():
+    """
+    Negative control (Stage 2 of #141, item 2 of #320): prove the harness
+    reports an absence. Without the documented ``init()`` the DataLoader patch
+    is never armed, so the dataloader_fetch stream must come back dark while
+    the callback-owned streams still flow.
+    """
+    if not _have("torch", "lightning"):
+        pytest.skip("lightning: required deps not installed")
+
+    emitted = _run_lightning(init=False)
+    required = {STEP_TIME_WIRE[k] for k in REQUIRED_STEP_TIME["lightning"]}
+    dark = sorted(w for w in required if w not in emitted)
+
+    assert dark == [STEP_TIME_WIRE["dataloader_fetch"]], (
+        f"expected exactly the fetch stream to be dark, got {dark}; "
+        f"emitted: {sorted(emitted)}"
+    )
