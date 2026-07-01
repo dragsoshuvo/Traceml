@@ -1,0 +1,1649 @@
+# Copyright 2026 OptAI UG (haftungsbeschraenkt)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Command handlers for the TraceML launcher CLI."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import secrets
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, BinaryIO, Callable, Iterable, Mapping, Optional
+
+from traceml_ai.launcher.launch_config import (
+    TORCH_LAUNCHER_REQUIRED,
+    DistributedLaunchConfig,
+    RunIdentity,
+    TorchrunLaunchConfig,
+)
+from traceml_ai.launcher.manifest import (
+    collect_existing_artifacts,
+    is_current_summary_artifact,
+    node_artifact_dir,
+    read_current_finalization_reason,
+    update_run_manifest,
+    utc_now_iso,
+    write_code_manifest,
+    write_run_manifest,
+)
+from traceml_ai.launcher.process import (
+    DEFAULT_SHUTDOWN_TIMEOUT_SEC,
+    DEFAULT_TCP_READY_TIMEOUT_SEC,
+    AggregatorPortInUseError,
+    ProcessOutputDrainer,
+    ProcessOutputResult,
+    TrainingOutcome,
+    ensure_aggregator_port_free,
+    install_shutdown_handlers,
+    start_aggregator_process,
+    start_training_process,
+    terminate_process_group,
+    wait_for_tcp_listen,
+)
+from traceml_ai.launcher.run_directory import (
+    RunDirectoryError,
+    join_run_root,
+    reserve_run_root,
+)
+from traceml_ai.loggers.error_log import get_error_logger, setup_error_logger
+from traceml_ai.regression.outcome import (
+    OUTCOME_FILENAME,
+    GuardTrainingResult,
+    collect_guard_outcomes,
+    write_guard_outcome,
+)
+from traceml_ai.runtime.launch_context import LaunchContext
+from traceml_ai.runtime.session import get_session_id
+from traceml_ai.runtime.settings import (
+    DEFAULT_FINALIZE_TIMEOUT_SEC,
+    DEFAULT_UI_MODE,
+    resolve_on_missing_aggregator,
+)
+from traceml_ai.utils.msgpack_codec import Decoder as MsgpackDecoder
+from traceml_ai.utils.torch_support import torch_available
+
+DASHBOARD_DEPENDENCY_INSTALL_HINT = (
+    "Dashboard mode requires the optional dashboard dependencies. "
+    'Install them with `pip install "traceml-ai[dashboard]"`.'
+)
+
+SINGLE_NODE_DEFAULT_MODE = DEFAULT_UI_MODE
+MULTI_NODE_DEFAULT_MODE = DEFAULT_UI_MODE
+_FAILURE_EXCERPT_BYTES = 8 * 1024
+_FAILURE_EXCERPT_LINES = 40
+# Start of the line TraceMLAggregator prints at stop when it dropped payloads
+# stamped for another run.
+_FOREIGN_RUN_WARNING = "[TraceML] WARNING: ignored "
+
+
+def _launch_defaults_for_topology(
+    defaults: Mapping[str, Any],
+    *,
+    nnodes: int,
+) -> dict[str, Any]:
+    """Return built-in launch defaults adjusted for the requested topology."""
+    resolved = dict(defaults)
+    resolved["mode"] = (
+        MULTI_NODE_DEFAULT_MODE
+        if int(nnodes) > 1
+        else SINGLE_NODE_DEFAULT_MODE
+    )
+    return resolved
+
+
+def _require_dashboard_dependencies(mode: str) -> None:
+    """Validate dashboard dependencies when dashboard mode is active."""
+    if mode != "dashboard":
+        return
+
+    missing = [
+        package
+        for package in ("nicegui",)
+        if importlib.util.find_spec(package) is None
+    ]
+    if missing:
+        raise SystemExit(
+            "[TraceML] ERROR: "
+            f"{DASHBOARD_DEPENDENCY_INSTALL_HINT} "
+            f"Missing: {', '.join(missing)}."
+        )
+
+
+def _dashboard_url(dashboard_port: int) -> str:
+    """Return the local browser URL for the dashboard."""
+    return f"http://127.0.0.1:{int(dashboard_port)}"
+
+
+def _dashboard_ssh_tunnel_command(dashboard_port: int) -> str:
+    """Return an SSH tunnel template for viewing a remote dashboard locally."""
+    port = int(dashboard_port)
+    return f"ssh -L {port}:127.0.0.1:{port} user@remote-host"
+
+
+def _boxed_message(title: str, lines: list[str]) -> str:
+    """Format a high-visibility ASCII box for important launch messages."""
+    content = [title, *lines]
+    width = max(len(line) for line in content)
+    border = "+" + "-" * (width + 2) + "+"
+    rows = [border]
+    rows.extend(f"| {line.ljust(width)} |" for line in content)
+    rows.append(border)
+    return "\n".join(rows)
+
+
+def _dashboard_access_box(dashboard_port: int) -> str:
+    """Return the dashboard access instructions shown after launch."""
+    url = _dashboard_url(dashboard_port)
+    ssh_cmd = _dashboard_ssh_tunnel_command(dashboard_port)
+    return _boxed_message(
+        "TraceML dashboard",
+        [
+            f"When the dashboard reports ready, open locally: {url}",
+            f"For remote access once ready, use an SSH tunnel: {ssh_cmd}",
+            "Then open the local URL above in your browser.",
+        ],
+    )
+
+
+def _log_launcher_exception(message: str, exc: Exception) -> None:
+    """Log launcher failures when the shared error logger is available."""
+    try:
+        get_error_logger("TraceMLLauncher").error(
+            "[TraceML] %s",
+            message,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+    except Exception:
+        pass
+
+
+def _binary_stream(stream: Any) -> Optional[BinaryIO]:
+    """Return a launcher terminal's binary buffer, when available."""
+    return getattr(stream, "buffer", None)
+
+
+def _stderr_excerpt(tail: bytes) -> str:
+    """Decode the bounded terminal excerpt without changing persisted bytes."""
+    text = tail[-_FAILURE_EXCERPT_BYTES:].decode("utf-8", errors="replace")
+    return "\n".join(text.splitlines()[-_FAILURE_EXCERPT_LINES:])
+
+
+def _start_training_output(
+    proc: subprocess.Popen,
+    *,
+    stdout_path: Path,
+    stderr_path: Path,
+    mode: str,
+) -> ProcessOutputDrainer:
+    """Own the two training pipes using the display policy for ``mode``."""
+    if proc.stdout is None or proc.stderr is None:
+        raise ValueError("training process output is not piped")
+    stdout_terminal = _binary_stream(sys.stdout)
+    stderr_terminal = _binary_stream(sys.stderr)
+    mirror_live = mode != "cli"
+    return ProcessOutputDrainer(
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        stdout_mirror=stdout_terminal if mirror_live else None,
+        stderr_mirror=stderr_terminal if mirror_live else None,
+        stdout_fallback=stdout_terminal,
+        stderr_fallback=stderr_terminal,
+    )
+
+
+def _start_aggregator_output(
+    proc: subprocess.Popen,
+    *,
+    stderr_path: Path,
+    mode: str,
+) -> ProcessOutputDrainer:
+    """Persist launcher-owned aggregator stderr without capturing stdout."""
+    if proc.stderr is None:
+        raise ValueError("aggregator process stderr is not piped")
+    stderr_terminal = _binary_stream(sys.stderr)
+    return ProcessOutputDrainer(
+        stderr=proc.stderr,
+        stderr_path=stderr_path,
+        stderr_mirror=stderr_terminal if mode != "cli" else None,
+        stderr_fallback=stderr_terminal,
+    )
+
+
+def _print_aggregator_stderr_path(path: Optional[Path]) -> None:
+    """Report confirmed raw aggregator diagnostics after a failure."""
+    if path is not None:
+        print(f"[TraceML] Aggregator stderr: {path}", file=sys.stderr)
+
+
+def _print_foreign_run_warnings(
+    result: Optional[ProcessOutputResult], *, mode: str
+) -> None:
+    """
+    Repeat the aggregator's foreign-run warning once cli rendering stopped.
+
+    Other modes mirror aggregator stderr live, so they already showed it. The
+    persisted stderr file is read first because the bounded tail can lose
+    the line on a chatty run.
+    """
+    if result is None or mode != "cli":
+        return
+
+    def matching(lines: Iterable[str]) -> list[str]:
+        found = []
+        for line in lines:
+            start = line.find(_FOREIGN_RUN_WARNING)
+            if start >= 0:
+                found.append(line[start:].rstrip("\r\n"))
+        return found
+
+    found: Optional[list[str]] = None
+    if result.stderr_path is not None:
+        try:
+            with open(
+                result.stderr_path, encoding="utf-8", errors="replace"
+            ) as stream:
+                found = matching(stream)
+        except OSError:
+            found = None
+    if found is None:
+        tail = result.stderr_tail.decode("utf-8", errors="replace")
+        found = matching(tail.splitlines())
+    for line in found:
+        print(line, file=sys.stderr)
+
+
+def _print_training_output(
+    result: Optional[ProcessOutputResult],
+    *,
+    mode: str,
+    training_failed: bool,
+) -> None:
+    """Print output diagnostics after live rendering has stopped."""
+    if result is None:
+        return
+    if result.warning:
+        print(f"[TraceML] WARNING: {result.warning}", file=sys.stderr)
+    if mode == "cli" and training_failed and result.stderr_tail:
+        excerpt = _stderr_excerpt(result.stderr_tail)
+        if excerpt:
+            print("[TraceML] Training stderr excerpt:", file=sys.stderr)
+            print(excerpt, file=sys.stderr)
+    if result.stderr_path is not None:
+        print(f"[TraceML] Stderr: {result.stderr_path}", file=sys.stderr)
+    if result.stdout_path is not None:
+        print(f"[TraceML] Stdout: {result.stdout_path}", file=sys.stderr)
+
+
+def _run_noncritical_launcher_step(
+    description: str,
+    operation: Callable[[], Any],
+) -> None:
+    """Run auxiliary launcher work without changing a started training run."""
+    try:
+        operation()
+    except Exception as exc:
+        _log_launcher_exception(description, exc)
+        print(
+            f"[TraceML] WARNING: {description}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def _claim_run_dir_or_exit(claim: Callable[[], None]) -> None:
+    """Claim the run directory, or exit before training starts."""
+    try:
+        claim()
+    except (RunDirectoryError, OSError) as exc:
+        raise SystemExit(f"[TraceML] ERROR: {exc}") from exc
+
+
+def _setup_launcher_error_logger(session_root: Path, node_rank: int) -> None:
+    """Set up this node's launcher error log without risking the launch."""
+    try:
+        setup_error_logger(
+            role="launcher",
+            session_root=session_root,
+            node_rank=node_rank,
+        )
+    except Exception:
+        pass
+
+
+def _resolve_cli_missing_aggregator_policy(args: argparse.Namespace) -> str:
+    """Resolve the CLI policy, whose frontend default is strict."""
+    try:
+        return resolve_on_missing_aggregator(
+            getattr(args, "on_missing_aggregator", None),
+            default="raise",
+        )
+    except ValueError as exc:
+        raise SystemExit(f"[TraceML] ERROR: {exc}") from exc
+
+
+def _derive_final_telemetry(
+    *,
+    telemetry_available: bool,
+    startup_reason: Optional[str],
+    aggregator_exited_early: bool,
+    aggregator_exit_code: Optional[int],
+    finalization_reason: Optional[str],
+    summary_required: bool,
+    summary_exists: bool,
+) -> tuple[str, Optional[str], Optional[int]]:
+    """Derive one final telemetry fact using the documented precedence."""
+    if not telemetry_available:
+        return "unavailable", startup_reason, aggregator_exit_code
+    if finalization_reason == "finalization_failed" or (
+        not aggregator_exited_early and aggregator_exit_code not in (0, None)
+    ):
+        return "failed", "finalization_failed", aggregator_exit_code
+    if aggregator_exited_early:
+        # Report the known crash, not the missing summary it caused.
+        status = (
+            "failed" if summary_required and not summary_exists else "degraded"
+        )
+        return status, "aggregator_exited_early", aggregator_exit_code
+    if summary_required and not summary_exists:
+        return "failed", "summary_missing", aggregator_exit_code
+    if finalization_reason == "finalization_warning":
+        return "degraded", "finalization_warning", aggregator_exit_code
+    return "complete", None, aggregator_exit_code
+
+
+def _print_telemetry_footer(
+    status: str,
+    reason: Optional[str],
+    aggregator_exit_code: Optional[int],
+    aggregator_stderr_path: Optional[Path] = None,
+) -> None:
+    """Print one factual telemetry line before the final training line."""
+    if status == "complete":
+        message = "Telemetry complete."
+    elif reason == "aggregator_spawn_failed":
+        message = "Telemetry unavailable: aggregator could not start."
+    elif reason == "aggregator_port_in_use":
+        message = "Telemetry unavailable: aggregator port was already in use."
+    elif reason == "aggregator_not_ready":
+        message = "Telemetry unavailable: aggregator was not reachable."
+    elif reason == "aggregator_exited_early":
+        suffix = (
+            f" (exit code {aggregator_exit_code})"
+            if aggregator_exit_code is not None
+            else ""
+        )
+        message = f"Telemetry degraded: aggregator exited early{suffix}."
+    elif reason == "summary_missing":
+        message = "Telemetry failed: final summary was not produced."
+    elif reason == "finalization_warning":
+        message = "Telemetry degraded: finalization completed with warnings."
+    elif reason == "finalization_failed":
+        suffix = (
+            f" (exit code {aggregator_exit_code})"
+            if aggregator_exit_code is not None
+            else ""
+        )
+        message = f"Telemetry failed during finalization{suffix}."
+    else:
+        message = f"Telemetry {status}."
+
+    if status != "complete" and aggregator_stderr_path is not None:
+        message += f" Aggregator stderr: {aggregator_stderr_path}"
+
+    print(f"[TraceML] {message}", file=sys.stderr, flush=True)
+
+
+def _is_torchrun_command(command: list[str]) -> bool:
+    """Return whether a constructed launcher command invokes torchrun."""
+    return command[1:3] == ["-m", "torch.distributed.run"]
+
+
+def _exit_with_training_outcome(
+    outcome: TrainingOutcome,
+    *,
+    launched_with_torchrun: bool,
+) -> None:
+    """Print the final training status and exit with its command result."""
+    if outcome.signal_name is not None:
+        message = (
+            f"Training terminated by {outcome.signal_name} "
+            f"(exit code {outcome.cli_exit_code})."
+        )
+    elif outcome.returncode == 0:
+        message = "Training completed successfully (exit code 0)."
+    elif launched_with_torchrun:
+        message = (
+            "Training failed — torchrun exited with code "
+            f"{outcome.cli_exit_code}."
+        )
+    else:
+        message = f"Training failed (exit code {outcome.cli_exit_code})."
+
+    print(f"[TraceML] {message}", file=sys.stderr, flush=True)
+    raise SystemExit(outcome.cli_exit_code)
+
+
+def resolve_existing_script_path(script_path: str) -> str:
+    """Resolve and validate the target training script path."""
+    path = Path(script_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Script not found: {script_path}")
+    if not path.is_file():
+        raise IsADirectoryError(f"Script path is not a file: {script_path}")
+    return str(path.resolve())
+
+
+def _disable_traceml_requested(
+    args: argparse.Namespace, environ: Mapping[str, str]
+) -> bool:
+    """Return True when the CLI or parent environment requests native launch."""
+    return bool(getattr(args, "disable_traceml", False)) or (
+        environ.get("TRACEML_DISABLED") == "1"
+    )
+
+
+def _disabled_native_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """Copy the user environment while removing stale TraceML settings."""
+    env = {
+        key: value
+        for key, value in environ.items()
+        if not key.startswith("TRACEML_")
+    }
+    env["TRACEML_DISABLED"] = "1"
+    return env
+
+
+def _launch_disabled_process(
+    *,
+    script_path: str,
+    args: argparse.Namespace,
+    torchrun_cfg: Any,
+    launch_context: LaunchContext,
+) -> None:
+    """Launch the target script natively with TraceML disabled."""
+    print(
+        "[TraceML] TraceML is disabled via --disable-traceml. "
+        "Running natively."
+    )
+    launcher_cmd = torchrun_cfg.to_command()
+    launched_with_torchrun = _is_torchrun_command(launcher_cmd)
+    train_cmd = [
+        *launcher_cmd,
+        str(script_path),
+        *(args.args or []),
+    ]
+    env = _disabled_native_env(os.environ)
+
+    train_proc: Optional[subprocess.Popen] = None
+    install_shutdown_handlers(lambda: (train_proc,), manifest_path=None)
+    train_proc = start_training_process(
+        train_cmd=train_cmd,
+        env=env,
+        cwd=launch_context.launch_cwd,
+        capture_output=False,
+    )
+    returncode = train_proc.wait()
+    _exit_with_training_outcome(
+        TrainingOutcome(returncode),
+        launched_with_torchrun=launched_with_torchrun,
+    )
+
+
+def _require_torch_launcher_support(torchrun: TorchrunLaunchConfig) -> None:
+    """Reject a torch-free multi-process launch before anything starts.
+
+    ``torch.distributed.run`` is what launches extra processes, so without
+    torch the topology is impossible. Checking it here means the user gets
+    one clear error instead of a started aggregator and a failure later.
+    """
+    if not torchrun.requires_torch_launcher():
+        return
+    if torch_available():
+        return
+    raise SystemExit(f"[TraceML] ERROR: {TORCH_LAUNCHER_REQUIRED}")
+
+
+def _require_run_torch_support(args: argparse.Namespace) -> None:
+    """Require torch for the step-aware ``run`` command."""
+    if getattr(args, "command", None) != "run":
+        return
+    if torch_available():
+        return
+    raise SystemExit(
+        "[TraceML] ERROR: traceml run requires torch for step-aware "
+        "diagnosis. Install it with: pip install 'traceml-ai[torch]'"
+    )
+
+
+def validate_launch_args(args: argparse.Namespace) -> None:
+    """Validate cross-argument constraints for TraceML launch commands."""
+    if _disable_traceml_requested(args, os.environ):
+        try:
+            torchrun_cfg = TorchrunLaunchConfig.from_args(args)
+        except ValueError as exc:
+            raise SystemExit(f"[TraceML] ERROR: {exc}") from exc
+        _require_torch_launcher_support(torchrun_cfg)
+        return
+
+    _resolve_cli_missing_aggregator_policy(args)
+
+    try:
+        launch_cfg = DistributedLaunchConfig.from_args(args)
+    except ValueError as exc:
+        raise SystemExit(f"[TraceML] ERROR: {exc}") from exc
+
+    _require_torch_launcher_support(launch_cfg.torchrun)
+    _require_run_torch_support(args)
+
+    try:
+        RunIdentity.from_args(
+            args,
+            generated_session_id="validation_placeholder",
+            require_explicit=launch_cfg.torchrun.nnodes > 1,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"[TraceML] ERROR: {exc}") from exc
+
+    explicit_mode = getattr(args, "mode", None)
+    if explicit_mode is not None:
+        _require_dashboard_dependencies(str(explicit_mode))
+
+    if explicit_mode == "summary" and getattr(args, "no_history", False):
+        raise SystemExit(
+            "[TraceML] ERROR: --mode=summary requires history. "
+            "Remove --no-history to enable final summary generation."
+        )
+    if getattr(args, "html_report", False) and getattr(
+        args, "no_history", False
+    ):
+        raise SystemExit(
+            "[TraceML] ERROR: --html-report requires history. "
+            "Remove --no-history to enable HTML report generation."
+        )
+    finalize_timeout_sec = getattr(args, "finalize_timeout_sec", None)
+    if finalize_timeout_sec is not None:
+        from traceml_ai.config.yaml_loader import is_finite_positive
+
+        if not is_finite_positive(finalize_timeout_sec):
+            raise SystemExit(
+                "[TraceML] ERROR: --finalize-timeout-sec must be a finite "
+                "number greater than 0."
+            )
+    trace_max_steps = getattr(args, "trace_max_steps", None)
+    if trace_max_steps is not None and int(trace_max_steps) <= 0:
+        raise SystemExit(
+            "[TraceML] ERROR: --trace-max-steps must be greater than 0."
+        )
+
+
+def launch_process(script_path: str, args: argparse.Namespace) -> None:
+    """Launch the TraceML aggregator and target training process."""
+    launch_context = LaunchContext.capture()
+
+    if _disable_traceml_requested(args, os.environ):
+        torchrun_cfg = TorchrunLaunchConfig.from_args(args)
+        _launch_disabled_process(
+            script_path=script_path,
+            args=args,
+            torchrun_cfg=torchrun_cfg,
+            launch_context=launch_context,
+        )
+
+    missing_aggregator_policy = _resolve_cli_missing_aggregator_policy(args)
+    launch_cfg = DistributedLaunchConfig.from_args(args)
+    torchrun_cfg = launch_cfg.torchrun
+
+    from traceml_ai.config.yaml_loader import (
+        BUILT_IN_DEFAULTS,
+        find_config_file,
+        load_yaml_config,
+        resolve_config,
+    )
+
+    config_path = find_config_file(Path(launch_context.launch_cwd))
+    try:
+        yaml_cfg = (
+            load_yaml_config(
+                config_path,
+                reject_guard_duplicates=(
+                    getattr(args, "command", None) == "run"
+                ),
+            )
+            if config_path is not None
+            else {}
+        )
+    except (ValueError, OSError) as exc:
+        print(f"[TraceML] ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    # Normalize the deprecated TRACEML_MODE env var to TRACEML_UI_MODE so that
+    # resolve_config sees it. Matches the fallback logic in executor and aggregator.
+    launcher_env: Mapping[str, str] = os.environ
+    if "TRACEML_UI_MODE" not in os.environ and "TRACEML_MODE" in os.environ:
+        launcher_env = {
+            **os.environ,
+            "TRACEML_UI_MODE": os.environ["TRACEML_MODE"],
+        }
+
+    aggregator_cfg = launch_cfg.aggregator
+    launch_defaults = _launch_defaults_for_topology(
+        BUILT_IN_DEFAULTS,
+        nnodes=torchrun_cfg.nnodes,
+    )
+
+    # None = flag not supplied; resolver falls through to env/yaml/default.
+    # --no-history inverts history_enabled: True flag → False override, absent → None.
+    # Distributed/identity settings (nproc, nnodes, master/aggregator address,
+    # run name) are owned by the typed launch configs below, not traceml.yaml.
+    cli_overrides = {
+        "mode": args.mode,
+        "interval": args.interval,
+        "enable_logging": args.enable_logging,
+        "logs_dir": args.logs_dir,
+        "history_enabled": (False if args.no_history else None),
+        "history_retention": getattr(args, "history_retention", None),
+        "finalize_timeout_sec": args.finalize_timeout_sec,
+        "dashboard_port": args.dashboard_port,
+        "dashboard_auto_open": (
+            False if args.no_dashboard_auto_open else None
+        ),
+    }
+
+    cfg = resolve_config(
+        cli_overrides=cli_overrides,
+        parent_env=launcher_env,
+        yaml_config=yaml_cfg,
+        defaults=launch_defaults,
+    )
+    cfg["finalize_timeout_sec"] = float(
+        cfg.get("finalize_timeout_sec") or DEFAULT_FINALIZE_TIMEOUT_SEC
+    )
+
+    # Cross-field validation after all sources are merged.
+    if cfg["mode"] == "summary" and not cfg["history_enabled"]:
+        raise SystemExit(
+            "[TraceML] ERROR: mode=summary requires history to be enabled. "
+            "Remove --no-history (or set history_enabled: true in traceml.yaml) "
+            "to enable final summary generation."
+        )
+
+    supported_modes = {"cli", "dashboard", "summary"}
+    if cfg["mode"] not in supported_modes:
+        raise SystemExit(
+            f"[TraceML] ERROR: invalid mode '{cfg['mode']}'. "
+            f"Valid modes: {sorted(supported_modes)}"
+        )
+
+    guard_contract = None
+    if getattr(args, "command", None) == "run" and "guard" in yaml_cfg:
+        from traceml_ai.regression.contract import (
+            ContractValidationError,
+            parse_guard_contract,
+        )
+
+        try:
+            guard_contract = parse_guard_contract(yaml_cfg["guard"])
+        except ContractValidationError as exc:
+            print(
+                "[TraceML] ERROR: invalid measurement contract in "
+                f"{config_path}: {exc}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from exc
+
+        if cfg["mode"] != "summary":
+            raise SystemExit(
+                "[TraceML] ERROR: guard pilot runs require mode=summary."
+            )
+
+        trace_max_steps = getattr(args, "trace_max_steps", None)
+        if trace_max_steps is not None and guard_contract.end_step > int(
+            trace_max_steps
+        ):
+            raise SystemExit(
+                "[TraceML] ERROR: guard.measurement ends after "
+                "--trace-max-steps; increase the trace limit or shorten "
+                "the requested window."
+            )
+
+    _require_dashboard_dependencies(str(cfg["mode"]))
+    save_training_output = bool(getattr(args, "save_training_output", True))
+    if cfg["mode"] == "cli" and not save_training_output:
+        print(
+            "[TraceML] WARNING: training output is inherited and may disturb "
+            "the live CLI display.",
+            file=sys.stderr,
+        )
+
+    owns_aggregator = aggregator_cfg.is_owner(node_rank=torchrun_cfg.node_rank)
+    # Root run metadata has one writer even when every node has a launcher.
+    is_root_writer = owns_aggregator
+
+    env = os.environ.copy()
+    env["TRACEML_DISABLED"] = "0"
+    env["TRACEML_PROFILE"] = getattr(args, "profile", "watch")
+    env["TRACEML_SCRIPT_PATH"] = script_path
+    env["TRACEML_UI_MODE"] = cfg["mode"]
+    env["TRACEML_INTERVAL"] = str(cfg["interval"])
+    env["TRACEML_ENABLE_LOGGING"] = "1" if cfg["enable_logging"] else "0"
+    env["TRACEML_LOGS_DIR"] = cfg["logs_dir"]
+    run_identity = RunIdentity.from_args(
+        args,
+        generated_session_id=get_session_id(),
+        require_explicit=torchrun_cfg.nnodes > 1,
+    )
+    env["TRACEML_SESSION_ID"] = run_identity.session_id
+    # A run name can be reused after its old directory is removed, and a
+    # surviving rank from that launch would still match the session id. A
+    # fresh nonce per launch tells them apart. Only a single-node launcher
+    # starts every rank, so multi-node runs send no nonce and rely on the
+    # session id alone.
+    env["TRACEML_RUN_NONCE"] = (
+        secrets.token_hex(16) if torchrun_cfg.nnodes == 1 else ""
+    )
+    env["TRACEML_AGGREGATOR_HOST"] = aggregator_cfg.connect_host
+    env["TRACEML_AGGREGATOR_BIND_HOST"] = aggregator_cfg.bind_host
+    env["TRACEML_AGGREGATOR_PORT"] = str(aggregator_cfg.port)
+    env["TRACEML_DASHBOARD_PORT"] = str(cfg["dashboard_port"])
+    env["TRACEML_DASHBOARD_AUTO_OPEN"] = (
+        "1" if cfg["dashboard_auto_open"] else "0"
+    )
+    env["TRACEML_FINALIZE_TIMEOUT_SEC"] = str(
+        float(cfg["finalize_timeout_sec"])
+    )
+    trace_max_steps = getattr(args, "trace_max_steps", None)
+    env["TRACEML_TRACE_MAX_STEPS"] = (
+        "" if trace_max_steps is None else str(int(trace_max_steps))
+    )
+    env["TRACEML_NNODES"] = str(torchrun_cfg.nnodes)
+    env["TRACEML_NPROC_PER_NODE"] = str(torchrun_cfg.nproc_per_node)
+    env["TRACEML_EXPECTED_WORLD_SIZE"] = str(
+        int(torchrun_cfg.nnodes) * int(torchrun_cfg.nproc_per_node)
+    )
+    env["TRACEML_NODE_RANK"] = str(torchrun_cfg.node_rank)
+    env["TRACEML_MASTER_ADDR"] = torchrun_cfg.master_addr
+    env["TRACEML_MASTER_PORT"] = str(torchrun_cfg.master_port)
+    env["TRACEML_HISTORY_ENABLED"] = "1" if cfg["history_enabled"] else "0"
+    env["TRACEML_HISTORY_RETENTION"] = str(float(cfg["history_retention"]))
+    env["TRACEML_HTML_REPORT"] = (
+        "1" if getattr(args, "html_report", False) else "0"
+    )
+    env["NODE_RANK"] = str(torchrun_cfg.node_rank)
+
+    env.update(launch_context.to_env())
+    execution_cwd = launch_context.launch_cwd
+
+    session_id = env["TRACEML_SESSION_ID"]
+    session_root = Path(cfg["logs_dir"]).resolve() / session_id
+    existing_manifest_path = session_root / "manifest.json"
+    if (
+        guard_contract is not None
+        and is_root_writer
+        and existing_manifest_path.exists()
+    ):
+        print(
+            "[TraceML] ERROR: guarded run name already exists at "
+            f"{existing_manifest_path}. Choose a new --run-name; TraceML "
+            "will not mix outcomes from separate executions.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    aggregator_dir = session_root / "aggregator"
+    db_path = aggregator_dir / "telemetry"
+    aggregator_stderr_log_path = aggregator_dir / "process.stderr.log"
+    node_dir = node_artifact_dir(session_root, torchrun_cfg.node_rank)
+    training_stdout_path = node_dir / "training.stdout.log"
+    training_stderr_path = node_dir / "training.stderr.log"
+
+    manifest_path: Optional[Path] = None
+    if is_root_writer:
+        # Node 0 owns the run directory; other nodes join it later.
+        _claim_run_dir_or_exit(lambda: reserve_run_root(session_root))
+        _setup_launcher_error_logger(session_root, torchrun_cfg.node_rank)
+        code_manifest_path = write_code_manifest(
+            session_root=session_root,
+            script_path=script_path,
+        )
+        manifest_extra: dict[str, Any] = {
+            "training_output": {
+                "enabled": save_training_output,
+                "scope": "node",
+            }
+        }
+        if guard_contract is not None:
+            manifest_extra["guard"] = {"contract": guard_contract.to_dict()}
+        if save_training_output:
+            manifest_extra["training_output"].update(
+                {
+                    "stdout_pattern": (
+                        "nodes/node_<node_rank>/training.stdout.log"
+                    ),
+                    "stderr_pattern": (
+                        "nodes/node_<node_rank>/training.stderr.log"
+                    ),
+                }
+            )
+        if code_manifest_path is not None:
+            manifest_extra["artifacts"] = {
+                "code_manifest": str(code_manifest_path)
+            }
+        manifest_path = write_run_manifest(
+            session_root=session_root,
+            session_id=session_id,
+            run=run_identity.to_manifest(),
+            script_path=script_path,
+            profile=env["TRACEML_PROFILE"],
+            ui_mode=cfg["mode"],
+            logs_dir=cfg["logs_dir"],
+            aggregator_host=aggregator_cfg.connect_host,
+            aggregator_bind_host=aggregator_cfg.bind_host,
+            aggregator_port=aggregator_cfg.port,
+            nnodes=torchrun_cfg.nnodes,
+            node_rank=torchrun_cfg.node_rank,
+            master_addr=torchrun_cfg.master_addr,
+            master_port=torchrun_cfg.master_port,
+            nproc_per_node=torchrun_cfg.nproc_per_node,
+            history_enabled=cfg["history_enabled"],
+            history_retention_s=float(cfg["history_retention"]),
+            finalize_timeout_sec=float(env["TRACEML_FINALIZE_TIMEOUT_SEC"]),
+            status="starting",
+            telemetry_status="starting" if owns_aggregator else None,
+            launch_cwd=execution_cwd,
+            aggregator_dir=aggregator_dir,
+            db_path=db_path,
+            extra=manifest_extra,
+        )
+        if guard_contract is not None:
+            print(
+                "[TraceML] Measurement contract captured from "
+                f"{config_path}: workload={guard_contract.workload_name}, "
+                f"steps={guard_contract.start_step}-{guard_contract.end_step}",
+                file=sys.stderr,
+            )
+
+    traceml_root = Path(__file__).resolve().parents[1]
+    runner_path = str(traceml_root / "runtime" / "executor.py")
+    script_args = args.args or []
+
+    launcher_cmd = torchrun_cfg.to_command()
+    launched_with_torchrun = _is_torchrun_command(launcher_cmd)
+    train_cmd = [
+        *launcher_cmd,
+        runner_path,
+        "--",
+        *script_args,
+    ]
+
+    agg_proc: Optional[subprocess.Popen] = None
+    train_proc: Optional[subprocess.Popen] = None
+    aggregator_output: Optional[ProcessOutputDrainer] = None
+    aggregator_output_result: Optional[ProcessOutputResult] = None
+    confirmed_aggregator_stderr_path: Optional[Path] = None
+    training_output: Optional[ProcessOutputDrainer] = None
+    aggregator_started_at: Optional[str] = None
+    aggregator_exit_code: Optional[int] = None
+    aggregator_exited_early = False
+    telemetry_available = False
+    telemetry_startup_reason: Optional[str] = None
+    port_conflict_detail: Optional[str] = None
+    guard_outcome_written = False
+    guard_training_result: Optional[GuardTrainingResult] = None
+
+    def record_guard_outcome(returncode: Optional[int] = None) -> None:
+        """Persist this node's training result once, without changing it."""
+        nonlocal guard_outcome_written
+        if guard_contract is None or guard_outcome_written:
+            return
+        observed_returncode = returncode
+        if observed_returncode is None and train_proc is not None:
+            observed_returncode = train_proc.returncode
+        if observed_returncode is None:
+            return
+
+        def write() -> None:
+            nonlocal guard_outcome_written
+            write_guard_outcome(
+                path=node_dir / OUTCOME_FILENAME,
+                manifest_path=session_root / "manifest.json",
+                session_id=session_id,
+                node_rank=torchrun_cfg.node_rank,
+                nnodes=torchrun_cfg.nnodes,
+                nproc_per_node=torchrun_cfg.nproc_per_node,
+                contract=guard_contract,
+                exit_code=TrainingOutcome(observed_returncode).cli_exit_code,
+            )
+            guard_outcome_written = True
+
+        _run_noncritical_launcher_step(
+            "failed to record the guarded training outcome", write
+        )
+
+    def collect_guard_training(timeout_s: float) -> None:
+        """Collect node outcomes once on the root launcher."""
+        nonlocal guard_training_result
+        if (
+            guard_contract is None
+            or not is_root_writer
+            or guard_training_result is not None
+        ):
+            return
+        if torchrun_cfg.nnodes > 1 and timeout_s > 0.0:
+            print(
+                "[TraceML] Waiting up to "
+                f"{timeout_s:g}s for {torchrun_cfg.nnodes} guarded "
+                "launcher outcomes...",
+                file=sys.stderr,
+            )
+        try:
+            guard_training_result = collect_guard_outcomes(
+                session_root=session_root,
+                run_name=run_identity.run_name,
+                nnodes=torchrun_cfg.nnodes,
+                nproc_per_node=torchrun_cfg.nproc_per_node,
+                contract=guard_contract,
+                timeout_s=timeout_s,
+            )
+        except Exception as exc:
+            _log_launcher_exception(
+                "failed to collect guarded training outcomes", exc
+            )
+            print(
+                "[TraceML] WARNING: failed to collect guarded training "
+                f"outcomes: {exc}",
+                file=sys.stderr,
+            )
+            guard_training_result = GuardTrainingResult(
+                status="incomplete",
+                nodes_expected=torchrun_cfg.nnodes,
+                nodes_observed=0,
+                reasons=("node_outcome_collection_failed",),
+                nodes=(),
+            )
+
+        result = guard_training_result
+        if result.status == "completed":
+            print(
+                "[TraceML] Guarded training outcomes complete "
+                f"({result.nodes_observed}/{result.nodes_expected} nodes).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "[TraceML] WARNING: guarded training outcomes incomplete "
+                f"({result.nodes_observed}/{result.nodes_expected} nodes; "
+                f"reasons={','.join(result.reasons)}).",
+                file=sys.stderr,
+            )
+
+    def finish_aggregator_output() -> Optional[ProcessOutputResult]:
+        nonlocal aggregator_output_result
+        nonlocal confirmed_aggregator_stderr_path
+        if aggregator_output is None:
+            return None
+        if aggregator_output_result is None:
+            aggregator_output_result = aggregator_output.finish()
+            confirmed_aggregator_stderr_path = (
+                aggregator_output_result.stderr_path
+            )
+            if aggregator_output_result.warning:
+                print(
+                    f"[TraceML] WARNING: {aggregator_output_result.warning}",
+                    file=sys.stderr,
+                )
+            _print_foreign_run_warnings(
+                aggregator_output_result, mode=str(cfg["mode"])
+            )
+        return aggregator_output_result
+
+    def finish_process_output() -> None:
+        # Signal teardown reaches this callback after reaping the training
+        # process, so interrupted guarded runs can record their real exit code.
+        record_guard_outcome()
+        collect_guard_training(timeout_s=0.0)
+        training_result = (
+            training_output.finish() if training_output is not None else None
+        )
+        finish_aggregator_output()
+
+        # The signal handler marks the run interrupted before this cleanup.
+        # Merge paths only after both drainers have confirmed their files.
+        if manifest_path is not None:
+            artifacts = aggregator_output_artifacts() or {}
+            if training_result is not None:
+                confirmed_paths = {
+                    "training_stdout_log": training_result.stdout_path,
+                    "training_stderr_log": training_result.stderr_path,
+                }
+                artifacts.update(
+                    {
+                        name: str(path)
+                        for name, path in confirmed_paths.items()
+                        if path is not None
+                    }
+                )
+            extra = None
+            if (
+                guard_contract is not None
+                and guard_training_result is not None
+            ):
+                extra = {
+                    "guard": {
+                        "contract": guard_contract.to_dict(),
+                        "training": guard_training_result.to_dict(),
+                    }
+                }
+            if artifacts or extra:
+                update_run_manifest(
+                    manifest_path, artifacts=artifacts, extra=extra
+                )
+
+    def aggregator_output_artifacts() -> Optional[dict[str, str]]:
+        if confirmed_aggregator_stderr_path is None:
+            return None
+        return {"aggregator_stderr_log": str(confirmed_aggregator_stderr_path)}
+
+    install_shutdown_handlers(
+        lambda: (train_proc, agg_proc),
+        manifest_path=manifest_path,
+        cleanup=finish_process_output,
+    )
+
+    if owns_aggregator:
+        print(
+            "[TraceML] Starting aggregator on "
+            f"{aggregator_cfg.bind_host}:{aggregator_cfg.port} "
+            f"(connect={aggregator_cfg.connect_host}, "
+            f"ui={cfg['mode']}, profile={env['TRACEML_PROFILE']})"
+        )
+        aggregator_started_at = utc_now_iso()
+        try:
+            ensure_aggregator_port_free(
+                aggregator_cfg.bind_host,
+                aggregator_cfg.port,
+                connect_host=aggregator_cfg.connect_host,
+            )
+            agg_proc = start_aggregator_process(env=env, cwd=execution_cwd)
+        except AggregatorPortInUseError as exc:
+            ready = False
+            telemetry_startup_reason = "aggregator_port_in_use"
+            port_conflict_detail = str(exc).rstrip(".")
+        except OSError as exc:
+            _log_launcher_exception("aggregator process could not start", exc)
+            ready = False
+            telemetry_startup_reason = "aggregator_spawn_failed"
+        else:
+            aggregator_output = _start_aggregator_output(
+                agg_proc,
+                stderr_path=aggregator_stderr_log_path,
+                mode=str(cfg["mode"]),
+            )
+            print(f"[TraceML] Aggregator PID: {agg_proc.pid}")
+            ready = wait_for_tcp_listen(
+                host=aggregator_cfg.connect_host,
+                port=aggregator_cfg.port,
+                proc=agg_proc,
+                timeout_sec=DEFAULT_TCP_READY_TIMEOUT_SEC,
+            )
+            if not ready:
+                telemetry_startup_reason = "aggregator_not_ready"
+    else:
+        print(
+            "[TraceML] Waiting for aggregator on "
+            f"{aggregator_cfg.connect_host}:{aggregator_cfg.port} "
+            f"(node_rank={torchrun_cfg.node_rank})"
+        )
+        ready = wait_for_tcp_listen(
+            host=aggregator_cfg.connect_host,
+            port=aggregator_cfg.port,
+            timeout_sec=DEFAULT_TCP_READY_TIMEOUT_SEC,
+        )
+        if not ready:
+            telemetry_startup_reason = "aggregator_not_ready"
+
+    if not ready:
+        aggregator_exit_code = (
+            agg_proc.poll() if agg_proc is not None else None
+        )
+        if agg_proc is not None:
+            terminate_process_group(agg_proc, timeout_sec=3.0)
+            aggregator_exit_code = agg_proc.returncode
+            agg_proc = None
+        finish_aggregator_output()
+        _print_aggregator_stderr_path(confirmed_aggregator_stderr_path)
+
+        if missing_aggregator_policy == "raise":
+            if manifest_path is not None:
+                _run_noncritical_launcher_step(
+                    "failed to record unavailable telemetry status",
+                    lambda: update_run_manifest(
+                        manifest_path,
+                        status="failed",
+                        artifacts=aggregator_output_artifacts(),
+                        telemetry_status=(
+                            "unavailable" if owns_aggregator else None
+                        ),
+                        telemetry_reason=telemetry_startup_reason,
+                        aggregator_exit_code=aggregator_exit_code,
+                    ),
+                )
+            exit_detail = (
+                f" (exit={aggregator_exit_code})"
+                if aggregator_exit_code is not None
+                else ""
+            )
+            if telemetry_startup_reason == "aggregator_port_in_use":
+                failure = port_conflict_detail or (
+                    "aggregator port was already in use by another process"
+                )
+            else:
+                failure = (
+                    "aggregator was not reachable at "
+                    f"{aggregator_cfg.connect_host}:{aggregator_cfg.port}"
+                )
+            print(
+                f"[TraceML] ERROR: {failure}"
+                f"{exit_detail}; training was not started. Use "
+                "--on-missing-aggregator=warn or "
+                "TRACEML_ON_MISSING_AGGREGATOR=warn only when the script "
+                "can run without TraceML telemetry or traceml.summary().",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+        if telemetry_startup_reason == "aggregator_port_in_use":
+            unavailable_detail = port_conflict_detail or (
+                "aggregator port was already in use by another process"
+            )
+        else:
+            unavailable_detail = "aggregator was not available"
+        print(
+            f"[TraceML] WARNING: {unavailable_detail}; training will continue "
+            "with TraceML disabled. Calls that require the aggregator, "
+            "including traceml.summary(), will fail.",
+            file=sys.stderr,
+        )
+        env["TRACEML_DISABLED"] = "1"
+    else:
+        telemetry_available = True
+        print("[TraceML] Aggregator ready.")
+
+    if not is_root_writer:
+        _claim_run_dir_or_exit(
+            lambda: join_run_root(
+                session_root,
+                run_name=run_identity.run_name,
+                node_rank=torchrun_cfg.node_rank,
+            )
+        )
+        _setup_launcher_error_logger(session_root, torchrun_cfg.node_rank)
+
+    if manifest_path is not None:
+        _run_noncritical_launcher_step(
+            "failed to record the running telemetry status",
+            lambda: update_run_manifest(
+                manifest_path,
+                status="running",
+                artifacts=aggregator_output_artifacts(),
+                telemetry_status=(
+                    ("running" if telemetry_available else "unavailable")
+                    if owns_aggregator
+                    else None
+                ),
+                telemetry_reason=telemetry_startup_reason,
+                aggregator_exit_code=aggregator_exit_code,
+            ),
+        )
+
+    train_proc = start_training_process(
+        train_cmd=train_cmd,
+        env=env,
+        cwd=execution_cwd,
+        capture_output=save_training_output,
+    )
+    training_started_at = utc_now_iso()
+    if save_training_output:
+        training_output = _start_training_output(
+            train_proc,
+            stdout_path=training_stdout_path,
+            stderr_path=training_stderr_path,
+            mode=str(cfg["mode"]),
+        )
+    if manifest_path is not None:
+        _run_noncritical_launcher_step(
+            "failed to record the training start time",
+            lambda: update_run_manifest(
+                manifest_path,
+                extra={
+                    "lifecycle": {"training_started_at": training_started_at}
+                },
+            ),
+        )
+    if owns_aggregator and telemetry_available and cfg["mode"] == "dashboard":
+        print(_dashboard_access_box(int(cfg["dashboard_port"])))
+
+    while True:
+        train_rc = train_proc.poll()
+        if train_rc is not None:
+            training_ended_at = utc_now_iso()
+            outcome = TrainingOutcome(train_rc)
+            final_status = "completed" if train_rc == 0 else "failed"
+            if manifest_path is not None:
+                # Aggregator shutdown builds the final summary, so persist the
+                # launcher-owned training result before asking it to stop.
+                _run_noncritical_launcher_step(
+                    "failed to record the final training state",
+                    lambda: update_run_manifest(
+                        manifest_path,
+                        status=final_status,
+                        extra={
+                            "lifecycle": {
+                                "training_ended_at": training_ended_at
+                            }
+                        },
+                    ),
+                )
+            record_guard_outcome(train_rc)
+            outcome_wait_s = (
+                float(env["TRACEML_FINALIZE_TIMEOUT_SEC"])
+                if outcome.cli_exit_code == 0 and guard_outcome_written
+                else 0.0
+            )
+            collect_guard_training(timeout_s=outcome_wait_s)
+            if (
+                manifest_path is not None
+                and guard_contract is not None
+                and guard_training_result is not None
+            ):
+                _run_noncritical_launcher_step(
+                    "failed to record the guarded training result",
+                    lambda: update_run_manifest(
+                        manifest_path,
+                        extra={
+                            "guard": {
+                                "contract": guard_contract.to_dict(),
+                                "training": guard_training_result.to_dict(),
+                            }
+                        },
+                    ),
+                )
+            output_result = (
+                training_output.finish()
+                if training_output is not None
+                else None
+            )
+            if agg_proc is not None:
+                print(
+                    "[TraceML] Training finished; stopping aggregator...",
+                    file=sys.stderr,
+                )
+                _run_noncritical_launcher_step(
+                    "failed to stop the TraceML aggregator",
+                    lambda: terminate_process_group(
+                        agg_proc,
+                        timeout_sec=(
+                            float(env["TRACEML_FINALIZE_TIMEOUT_SEC"])
+                            + DEFAULT_SHUTDOWN_TIMEOUT_SEC
+                        ),
+                    ),
+                )
+                aggregator_exit_code = agg_proc.returncode
+                finish_aggregator_output()
+
+            telemetry_status: Optional[str] = None
+            telemetry_reason: Optional[str] = None
+            if owns_aggregator:
+                finalization_reason = None
+                if telemetry_available and aggregator_started_at is not None:
+                    finalization_reason = read_current_finalization_reason(
+                        aggregator_dir,
+                        aggregator_started_at=aggregator_started_at,
+                    )
+                telemetry_status, telemetry_reason, aggregator_exit_code = (
+                    _derive_final_telemetry(
+                        telemetry_available=telemetry_available,
+                        startup_reason=telemetry_startup_reason,
+                        aggregator_exited_early=aggregator_exited_early,
+                        aggregator_exit_code=aggregator_exit_code,
+                        finalization_reason=finalization_reason,
+                        summary_required=(
+                            cfg["mode"] == "summary" and cfg["history_enabled"]
+                        ),
+                        summary_exists=(
+                            aggregator_started_at is not None
+                            and is_current_summary_artifact(
+                                session_root / "final_summary.json",
+                                aggregator_started_at=aggregator_started_at,
+                            )
+                        ),
+                    )
+                )
+            if manifest_path is not None:
+                _run_noncritical_launcher_step(
+                    "failed to finalize the run manifest",
+                    lambda: update_run_manifest(
+                        manifest_path,
+                        artifacts=collect_existing_artifacts(
+                            db_path,
+                            session_root=session_root,
+                            training_stdout_path=(
+                                output_result.stdout_path
+                                if output_result is not None
+                                else None
+                            ),
+                            training_stderr_path=(
+                                output_result.stderr_path
+                                if output_result is not None
+                                else None
+                            ),
+                            aggregator_stderr_path=(
+                                confirmed_aggregator_stderr_path
+                            ),
+                        ),
+                        telemetry_status=telemetry_status,
+                        telemetry_reason=telemetry_reason,
+                        aggregator_exit_code=aggregator_exit_code,
+                    ),
+                )
+            _print_training_output(
+                output_result,
+                mode=str(cfg["mode"]),
+                training_failed=train_rc != 0,
+            )
+            if owns_aggregator and telemetry_status is not None:
+                _print_telemetry_footer(
+                    telemetry_status,
+                    telemetry_reason,
+                    aggregator_exit_code,
+                    confirmed_aggregator_stderr_path,
+                )
+            _exit_with_training_outcome(
+                outcome,
+                launched_with_torchrun=launched_with_torchrun,
+            )
+
+        if agg_proc is not None and agg_proc.poll() is not None:
+            agg_rc = agg_proc.returncode
+            aggregator_exited_early = True
+            aggregator_exit_code = agg_rc
+            finish_aggregator_output()
+            print(
+                f"[TraceML] WARNING: aggregator exited early (code={agg_rc}). "
+                "Training will continue without TraceML telemetry.",
+                file=sys.stderr,
+            )
+            _print_aggregator_stderr_path(confirmed_aggregator_stderr_path)
+            if manifest_path is not None:
+                _run_noncritical_launcher_step(
+                    "failed to record degraded telemetry status",
+                    lambda: update_run_manifest(
+                        manifest_path,
+                        artifacts=aggregator_output_artifacts(),
+                        telemetry_status="degraded",
+                        telemetry_reason="aggregator_exited_early",
+                        aggregator_exit_code=agg_rc,
+                    ),
+                )
+            agg_proc = None
+
+        time.sleep(1.0)
+
+
+def run_with_tracing(args: argparse.Namespace, profile: str) -> None:
+    """Run a script with TraceML enabled for a selected telemetry profile."""
+    args.profile = profile
+    try:
+        script_path = resolve_existing_script_path(args.script)
+    except (FileNotFoundError, IsADirectoryError) as exc:
+        print(f"[TraceML] ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    launch_process(script_path=script_path, args=args)
+
+
+def _resolve_serve_settings(args: argparse.Namespace):
+    """Resolve aggregator settings for ``traceml serve``.
+
+    UI/telemetry settings route through the shared config resolver
+    (CLI > env > traceml.yaml > default), the same resolver the launcher uses.
+    Aggregator host/bind-host/port come from serve's own flags, and run
+    identity reuses the launcher's ``RunIdentity``.
+    """
+    from traceml_ai.config.yaml_loader import (
+        BUILT_IN_DEFAULTS,
+        find_config_file,
+        load_yaml_config,
+        resolve_config,
+    )
+    from traceml_ai.runtime.settings import (
+        AggregatorTransportSettings,
+        TraceMLSettings,
+    )
+
+    config_path = find_config_file(Path.cwd())
+    try:
+        yaml_cfg = (
+            load_yaml_config(config_path) if config_path is not None else {}
+        )
+    except (ValueError, OSError) as exc:
+        raise SystemExit(f"[TraceML] ERROR: {exc}")
+
+    cli_overrides = {
+        "mode": args.mode,
+        "interval": args.interval,
+        "enable_logging": args.enable_logging,
+        "logs_dir": args.logs_dir,
+        "history_retention": getattr(args, "history_retention", None),
+    }
+    cfg = resolve_config(
+        cli_overrides=cli_overrides,
+        parent_env=os.environ,
+        yaml_config=yaml_cfg,
+        defaults=BUILT_IN_DEFAULTS,
+    )
+
+    run_identity = RunIdentity.from_args(
+        args,
+        generated_session_id=get_session_id(),
+        require_explicit=False,
+    )
+
+    connect_host = str(getattr(args, "aggregator_host", None) or "127.0.0.1")
+    bind_host = str(getattr(args, "aggregator_bind_host", None) or "127.0.0.1")
+    port = int(getattr(args, "aggregator_port", 29765))
+
+    # Expected worker count so the aggregator waits for ALL ranks before
+    # finalizing (and warns about ranks that never report). Prefer explicit
+    # --nnodes x --nproc-per-node, else TRACEML_EXPECTED_WORLD_SIZE (matching
+    # the `traceml run` launcher), else 1. Without this the finalize gate
+    # treats the first finished rank as "all done" on multi-rank jobs.
+    nnodes = getattr(args, "nnodes", None)
+    nproc = getattr(args, "nproc_per_node", None)
+    if nnodes and nproc:
+        expected_world_size = int(nnodes) * int(nproc)
+    else:
+        env_ws = os.environ.get("TRACEML_EXPECTED_WORLD_SIZE")
+        try:
+            expected_world_size = int(env_ws) if env_ws else 1
+        except ValueError:
+            expected_world_size = 1
+    expected_world_size = max(1, expected_world_size)
+
+    return TraceMLSettings(
+        mode=str(cfg["mode"]),
+        expected_world_size=expected_world_size,
+        render_interval_sec=float(cfg["interval"]),
+        enable_logging=bool(cfg["enable_logging"]),
+        logs_dir=str(cfg["logs_dir"]),
+        history_enabled=bool(cfg["history_enabled"]),
+        history_retention_s=float(cfg["history_retention"]),
+        dashboard_port=int(cfg["dashboard_port"]),
+        dashboard_auto_open=bool(cfg["dashboard_auto_open"]),
+        finalize_timeout_sec=float(cfg["finalize_timeout_sec"]),
+        session_id=run_identity.session_id,
+        # With --run-name/--session-id, drop ranks that name a different run
+        # explicitly. A plain `python train.py` makes up its own id and is
+        # still admitted, as it is when serve has no explicit id at all.
+        enforce_session_id=run_identity.source != "generated",
+        admit_generated_session_id=True,
+        aggregator=AggregatorTransportSettings(
+            connect_host=connect_host,
+            bind_host=bind_host,
+            port=port,
+        ),
+    )
+
+
+def run_serve(args: argparse.Namespace) -> None:
+    """Run the TraceML aggregator standalone in the foreground.
+
+    Starts only the aggregator; it never launches or wraps a user training
+    script. Reuses ``aggregator_main.run_aggregator`` so it binds host/port,
+    prints the reachable endpoint, blocks until SIGINT/SIGTERM, shuts down
+    cleanly, and preserves final-summary behavior.
+    """
+    try:
+        settings = _resolve_serve_settings(args)
+    except ValueError as exc:
+        raise SystemExit(f"[TraceML] ERROR: {exc}") from exc
+
+    _require_dashboard_dependencies(settings.mode)
+
+    from traceml_ai.aggregator.aggregator_main import run_aggregator
+
+    raise SystemExit(run_aggregator(settings))
+
+
+def run_inspect(args: argparse.Namespace) -> None:
+    """Decode and print binary msgpack logs for debugging."""
+    path = Path(args.file)
+    if not path.exists() or not path.is_file():
+        print(f"[TraceML] ERROR: file not found: {args.file}", file=sys.stderr)
+        raise SystemExit(1)
+
+    decoder = MsgpackDecoder()
+    with open(path, "rb") as f:
+        try:
+            while True:
+                header = f.read(4)
+                if not header:
+                    break
+                if len(header) < 4:
+                    print(
+                        "[TraceML] WARNING: truncated frame header",
+                        file=sys.stderr,
+                    )
+                    break
+                length = struct.unpack("!I", header)[0]
+                payload = f.read(length)
+                if len(payload) < length:
+                    print(
+                        "[TraceML] WARNING: truncated frame payload",
+                        file=sys.stderr,
+                    )
+                    break
+                record = decoder.decode(payload)
+                print(json.dumps(record, indent=2))
+        except Exception as exc:
+            _log_launcher_exception(f"inspect failed for {path}", exc)
+            print(
+                f"[TraceML] ERROR: decoding failed for {path.name}: {exc}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+
+_CI_POLICY_EXIT_CODES = {
+    "FASTER_IN_THIS_PAIR": 0,
+    "WITHIN_THRESHOLD_IN_THIS_PAIR": 0,
+    # argparse reserves exit code 2 for invalid command-line usage. Keep a
+    # measured regression distinct so CI can tell a failed check from a typo.
+    "SLOWER_IN_THIS_PAIR": 4,
+    "INCONCLUSIVE": 3,
+}
+
+
+def _compare_exit_code(payload: object) -> int:
+    """Map an optional evaluated CI result to the public process exit code."""
+    if not isinstance(payload, dict):
+        return 0
+    policy = payload.get("ci_policy")
+    if not isinstance(policy, dict):
+        return 0
+    result = policy.get("result")
+    try:
+        return _CI_POLICY_EXIT_CODES[result]
+    except (KeyError, TypeError):
+        raise RuntimeError(
+            "compare produced an unsupported CI policy result"
+        ) from None
+
+
+def run_compare(args: argparse.Namespace) -> None:
+    """Compare two TraceML final summary JSON files."""
+    try:
+        from traceml_ai.reporting.compare import compare_summaries
+
+        payload = compare_summaries(
+            args.left,
+            args.right,
+            output=args.output,
+            max_step_time_regression_pct=args.max_step_time_regression_pct,
+            print_to_stdout=True,
+        )
+        exit_code = _compare_exit_code(payload)
+        if exit_code:
+            # compare_summaries writes JSON and text before returning, so CI
+            # retains the evidence even when the evaluated command fails.
+            raise SystemExit(exit_code)
+    except RuntimeError as exc:
+        _log_launcher_exception("compare failed with a user-facing error", exc)
+        print(f"[TraceML] ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    except Exception as exc:
+        _log_launcher_exception("compare failed unexpectedly", exc)
+        print(f"[TraceML] ERROR: compare failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def run_view(args: argparse.Namespace) -> None:
+    """Print the stored text from a TraceML summary JSON file.
+
+    With ``--html`` (``args.html`` is not None), render an HTML report from
+    the JSON instead of printing text; an empty string means the default
+    ``<summary>.html`` output path.
+    """
+    html_out = getattr(args, "html", None)
+    try:
+        if html_out is not None:
+            from traceml_ai.reporting.html import render_html_report_from_file
+
+            written = render_html_report_from_file(
+                args.summary, html_out or None
+            )
+            print(f"[TraceML] Wrote HTML report: {written}")
+            return
+
+        from traceml_ai.reporting.view import view_summary
+
+        view_summary(
+            args.summary,
+            print_to_stdout=True,
+            re_render=bool(getattr(args, "re_render", False)),
+        )
+    except RuntimeError as exc:
+        print(f"[TraceML] ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    except Exception as exc:
+        _log_launcher_exception("view failed unexpectedly", exc)
+        print(f"[TraceML] ERROR: view failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)
