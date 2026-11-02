@@ -67,7 +67,7 @@ dev = [
     # that CI considers clean.
     "black==26.5.1",
     "ruff==0.15.22",
-    "isort==9.0.1",
+    "isort==9.0.2",
     "pre-commit",
     "codespell>=2.4.1",
     "nbstripout",
